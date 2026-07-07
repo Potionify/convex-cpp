@@ -17,6 +17,8 @@
 #include <vector>
 
 #include <convex/client.h>
+#include <convex/file_storage.h>
+#include <convex/http_client.h>
 #include <convex/json_codec.h>
 #include <gtest/gtest.h>
 
@@ -249,6 +251,80 @@ TEST(Live, AdminAuthenticate) {
     auto future = c.query("counters:get", {{"name", value("auth-smoke")}});
     const auto result = await(future);
     EXPECT_TRUE(result.ok()) << result.error_message();
+}
+
+TEST(LiveHttp, QueryMutationActionAndErrors) {
+    http_client c(local_url(), transports::make_ixwebsocket_http_transport());
+
+    // Query with full value fidelity.
+    auto sink_future = c.query("values:kitchenSink", {});
+    const auto sink = await(sink_future);
+    ASSERT_TRUE(sink.ok()) << sink.error_message();
+    EXPECT_EQ(sink.get_value().as_object().at("int64Big"),
+              value(std::int64_t{9007199254740993}));
+
+    // Mutation round trip (echo).
+    const value payload(value_object{{"n", value(std::numeric_limits<std::int64_t>::min())},
+                                     {"b", value(bytes{1, 2, 3})}});
+    auto echo_future = c.mutation("values:echoMutation", {{"x", payload}});
+    const auto echo = await(echo_future);
+    ASSERT_TRUE(echo.ok()) << echo.error_message();
+    EXPECT_EQ(to_wire_json(echo.get_value()), to_wire_json(payload));
+
+    // Action.
+    auto now_future = c.action("actions:now", {});
+    EXPECT_GT(await(now_future).get_value().as_float64(), 1.7e12);
+
+    // ConvexError data survives the HTTP path (status 560).
+    auto err_future = c.query("errors:throwConvexError", {});
+    const auto err = await(err_future);
+    ASSERT_FALSE(err.ok());
+    ASSERT_TRUE(err.is_app_error()) << err.error_message();
+    EXPECT_EQ(err.app_error()->data.as_object().at("code"), value("TEST"));
+
+    // Unknown function is a plain error, not a transport failure. (The
+    // local backend redacts the detail to "Server Error"; cloud spells out
+    // "Could not find public function".)
+    auto missing_future = c.query("nope:missing", {});
+    const auto missing = await(missing_future);
+    ASSERT_FALSE(missing.ok());
+    EXPECT_FALSE(missing.is_app_error());
+    EXPECT_FALSE(missing.error_message().empty());
+}
+
+TEST(LiveHttp, FileStorageRoundTrip) {
+    auto transport = transports::make_ixwebsocket_http_transport();
+    http_client c(local_url(), transport);
+
+    // 1. Generate an upload URL.
+    auto url_future = c.mutation("files:generateUploadUrl", {});
+    const auto url_result = await(url_future);
+    ASSERT_TRUE(url_result.ok()) << url_result.error_message();
+    const std::string upload_url = url_result.get_value().as_string();
+
+    // 2. Upload bytes (with a few non-UTF8 values to prove binary safety).
+    bytes payload{0x00, 0x01, 0xff, 0xfe, 'c', 'o', 'n', 'v', 'e', 'x', 0x80};
+    auto store_future = store_file(*transport, upload_url, "application/octet-stream", payload);
+    const auto stored = await(store_future);
+    ASSERT_TRUE(stored.ok()) << stored.error_message();
+    const std::string storage_id = stored.get_value().as_object().at("storageId").as_string();
+    EXPECT_FALSE(storage_id.empty());
+
+    // 3. Metadata reflects the upload.
+    auto meta_future = c.query("files:getMetadata", {{"storageId", value(storage_id)}});
+    const auto meta = await(meta_future);
+    ASSERT_TRUE(meta.ok()) << meta.error_message();
+    EXPECT_EQ(meta.get_value().as_object().at("size"),
+              value(static_cast<double>(payload.size())));
+
+    // 4. Resolve a download URL and fetch the bytes back.
+    auto get_url_future = c.query("files:getUrl", {{"storageId", value(storage_id)}});
+    const auto get_url = await(get_url_future);
+    ASSERT_TRUE(get_url.ok()) << get_url.error_message();
+    auto fetch_future = fetch_file(*transport, get_url.get_value().as_string());
+    const auto fetched = await(fetch_future);
+    ASSERT_TRUE(fetched.ok()) << fetched.error_message();
+    EXPECT_EQ(fetched.get_value(), value(payload));
 }
 
 TEST(Live, CloudTlsSmoke) {

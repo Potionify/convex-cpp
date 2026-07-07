@@ -14,4 +14,8 @@ namespace convex::transports {
 /// platform network stack (WSAStartup on Windows) on first use.
 std::shared_ptr<websocket_transport> make_ixwebsocket_transport();
 
+/// Create the IXWebSocket-backed async HTTP transport (for
+/// convex::http_client and the file storage helpers).
+std::shared_ptr<http_transport> make_ixwebsocket_http_transport();
+
 }  // namespace convex::transports

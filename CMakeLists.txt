@@ -19,6 +19,8 @@ add_library(convex STATIC
     src/protocol.cpp
     src/base_client.cpp
     src/client.cpp
+    src/http_client.cpp
+    src/file_storage.cpp
 )
 add_library(convex::convex ALIAS convex)
 

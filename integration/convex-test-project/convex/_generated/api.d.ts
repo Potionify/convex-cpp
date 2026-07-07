@@ -11,6 +11,7 @@
 import type * as actions from "../actions.js";
 import type * as counters from "../counters.js";
 import type * as errors from "../errors.js";
+import type * as files from "../files.js";
 import type * as messages from "../messages.js";
 import type * as values from "../values.js";
 
@@ -24,6 +25,7 @@ declare const fullApi: ApiFromModules<{
   actions: typeof actions;
   counters: typeof counters;
   errors: typeof errors;
+  files: typeof files;
   messages: typeof messages;
   values: typeof values;
 }>;
