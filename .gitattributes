@@ -1,0 +1,8 @@
+* text=auto
+*.h text
+*.cpp text
+*.ts text
+*.md text
+*.yml text
+*.ps1 text
+CMakeLists.txt text

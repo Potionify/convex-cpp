@@ -67,3 +67,15 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# IDE
+.vs/
+out/
+.idea/
+
+# secrets / local environment
+*.env.local
+integration/local.env
+
+# node (integration test project)
+node_modules/

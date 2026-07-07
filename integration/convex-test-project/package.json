@@ -1,0 +1,15 @@
+{
+  "name": "convex-cpp-integration-test-project",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Minimal Convex backend exercising the full Convex value space for C++ client integration tests.",
+  "type": "module",
+  "scripts": {
+    "dev": "convex dev",
+    "deploy:local": "convex deploy",
+    "deploy:cloud": "convex deploy -y"
+  },
+  "dependencies": {
+    "convex": "^1.17.0"
+  }
+}
