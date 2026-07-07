@@ -63,6 +63,9 @@ public:
         /// True when query results changed and a fresh snapshot should be
         /// delivered to subscribers.
         bool state_changed = false;
+        /// Queries whose results changed in this message (updated, failed,
+        /// or removed), for per-subscription update delivery.
+        std::vector<query_id> changed_queries;
         /// Requests whose results became deliverable. Successful mutations
         /// appear here only once a Transition has advanced past their
         /// timestamp (read-your-writes); failed mutations and all actions

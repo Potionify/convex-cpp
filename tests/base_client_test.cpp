@@ -250,6 +250,11 @@ TEST(Restart, RebuildsAuthQueriesAndMutationsInOrder) {
     u.journal = "journal-token";
     (void)c.receive_message(make_transition({0, 0, 0}, {1, 1, 5}, {u}));
 
+    // Simulate the runtime having sent everything queued so far: only
+    // actions already on the wire are at risk and must fail on restart.
+    while (c.pop_next_message().has_value()) {
+    }
+
     const auto failed = c.restart(auth_token::user("fresh-jwt"));
 
     // In-flight action fails; mutations survive.
@@ -311,6 +316,18 @@ TEST(Restart, ConnectMessageTracksCountAndTimestamp) {
     EXPECT_EQ(second.connection_count, 1u);
     EXPECT_EQ(second.last_close_reason, "InactiveServer");
     EXPECT_EQ(second.max_observed_timestamp, timestamp{42});
+}
+
+TEST(Restart, NeverSentActionsAreResentNotFailed) {
+    base_client c;
+    // The action is enqueued but the transport never drained it, so it was
+    // never on the wire: resending is safe and expected.
+    const request_id act = c.action("actions:echoAction", {});
+
+    const auto failed = c.restart();
+    EXPECT_TRUE(failed.empty());
+    EXPECT_EQ(expect_message<action_request_message>(c).id, act);
+    expect_empty(c);
 }
 
 TEST(Restart, CompletedButUndeliveredMutationsAreResent) {

@@ -173,6 +173,7 @@ base_client::receive_result base_client::handle_transition(const transition_mess
     }
     for (const state_modification& mod : t.modifications) {
         apply_state_modification(mod);
+        std::visit([&out](const auto& m) { out.changed_queries.push_back(m.id); }, mod);
     }
     remote_version_ = t.end_version;
     observe_timestamp(t.end_version.ts);
@@ -250,6 +251,16 @@ std::optional<client_message> base_client::pop_next_message() {
 
 std::vector<std::pair<request_id, function_result>> base_client::restart(
     std::optional<auth_token> refreshed_auth) {
+    // Actions still sitting in the outgoing queue were never transmitted, so
+    // they are safe to resend; only actions already on the wire are at risk
+    // of double execution.
+    std::set<request_id> unsent_actions;
+    for (const client_message& m : outgoing_) {
+        if (const auto* a = std::get_if<action_request_message>(&m)) {
+            unsent_actions.insert(a->id);
+        }
+    }
+
     // Stale queued messages carry stale version numbers; drop them all.
     outgoing_.clear();
 
@@ -291,7 +302,8 @@ std::vector<std::pair<request_id, function_result>> base_client::restart(
     // idempotent: fail them.
     std::vector<std::pair<request_id, function_result>> failed_actions;
     for (auto it = ongoing_requests_.begin(); it != ongoing_requests_.end();) {
-        if (it->second.typ == pending_request::kind::action) {
+        if (it->second.typ == pending_request::kind::action &&
+            !unsent_actions.contains(it->first)) {
             failed_actions.emplace_back(
                 it->first,
                 function_result::error("Connection lost while action was in flight"));
