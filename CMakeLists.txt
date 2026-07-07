@@ -16,6 +16,7 @@ add_library(convex STATIC
     src/value.cpp
     src/detail/base64.cpp
     src/json_codec.cpp
+    src/protocol.cpp
 )
 add_library(convex::convex ALIAS convex)
 
