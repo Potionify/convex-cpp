@@ -59,10 +59,12 @@ public:
     /// on a malformed URL or missing transport.
     explicit client(client_options options);
 
-    /// Closes the connection and stops all internal threads. Pending
-    /// mutation/action callbacks complete with an error; futures from the
-    /// promise-based overloads are satisfied, never broken. Subscription
-    /// handles may safely outlive the client (their callbacks just stop).
+    /// Closes the connection and stops all internal threads. Callbacks still
+    /// queued for process_events() are delivered from the destructor (on the
+    /// destroying thread); remaining pending mutation/action callbacks then
+    /// complete with an error. Futures from the promise-based overloads are
+    /// always satisfied, never broken. Subscription handles may safely
+    /// outlive the client (their callbacks just stop).
     ~client();
 
     client(const client&) = delete;

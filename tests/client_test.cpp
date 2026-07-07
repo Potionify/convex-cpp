@@ -307,6 +307,32 @@ TEST(Client, ShutdownCompletesPendingRequests) {
     EXPECT_NE(result.error_message().find("shut down"), std::string::npos);
 }
 
+TEST(Client, ShutdownDeliversQueuedButUnpumpedCallbacks) {
+    // Regression: in pumped mode a completion callback that
+    // already moved from `pending` into the event queue was dropped if the
+    // client was destroyed before the next process_events(), breaking the
+    // future. Shutdown must deliver queued callbacks.
+    auto transport = std::make_shared<mock_transport>();
+    std::future<function_result> future;
+    {
+        client c(make_options(transport));
+        ASSERT_TRUE(transport->wait_for_attempts(1));
+        transport->open(0);
+        ASSERT_TRUE(transport->wait_for_sent(0, 1));
+        future = c.mutation("messages:send", {});
+        ASSERT_TRUE(transport->wait_for_sent(0, 2));
+        // Failure responses complete immediately, queueing the callback.
+        transport->server_send(0,
+                               R"({"type":"MutationResponse","requestId":0,"success":false,)"
+                               R"("result":"boom","logLines":[]})");
+        // Destroy without ever pumping.
+    }
+    ASSERT_EQ(future.wait_for(1s), std::future_status::ready);
+    const auto result = future.get();  // must not throw broken_promise
+    EXPECT_FALSE(result.ok());
+    EXPECT_NE(result.error_message().find("boom"), std::string::npos);
+}
+
 TEST(Client, SubscriptionHandleOutlivesClient) {
     auto transport = std::make_shared<mock_transport>();
     client::subscription sub;

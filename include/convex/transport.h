@@ -38,6 +38,10 @@ public:
     virtual ~websocket_connection() = default;
 
     /// Queue a text frame. Called only between on_open() and on_close().
+    /// The caller may hold internal locks: implementations must NOT invoke
+    /// observer callbacks synchronously from inside this call (report
+    /// failures asynchronously, e.g. from the socket thread) and must not
+    /// block on network I/O.
     virtual void send_text(std::string text) = 0;
 };
 

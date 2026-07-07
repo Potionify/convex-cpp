@@ -1,5 +1,7 @@
 #include "detail/wire_json.h"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>

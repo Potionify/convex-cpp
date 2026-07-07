@@ -485,11 +485,17 @@ struct client_impl : std::enable_shared_from_this<client_impl> {
         if (worker.joinable()) worker.join();
         dead_conn.reset();  // outside the lock: may join transport threads
         dead_slot.reset();
+        std::deque<std::function<void()>> undelivered;
         {
-            // Anything the worker parked before stopping.
             std::lock_guard lk(mu);
+            // Anything the worker parked before stopping.
             garbage.clear();
+            // In pumped mode, completion callbacks may already have moved out
+            // of `pending` into the event queue; dropping them would break
+            // their futures. Deliver them now, before the orphan errors.
+            undelivered.swap(event_queue);
         }
+        for (auto& fn : undelivered) fn();
         for (auto& cb : orphaned) cb(function_result::error("convex: client is shut down"));
     }
 };
