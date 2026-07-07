@@ -1,6 +1,7 @@
 add_executable(convex_tests
     value_json_test.cpp
     protocol_test.cpp
+    base_client_test.cpp
 )
 target_link_libraries(convex_tests PRIVATE convex::convex GTest::gtest_main)
 # Tests may exercise internal (src/detail) helpers directly.
