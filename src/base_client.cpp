@@ -141,8 +141,19 @@ void base_client::flush_completed(timestamp watermark,
     }
 }
 
-void base_client::apply_state_modification(const state_modification& mod) {
+std::string base_client::udf_path_for(query_id id) const {
+    const auto token_it = id_to_token_.find(id);
+    if (token_it == id_to_token_.end()) return {};
+    const auto query_it = query_set_.find(token_it->second);
+    return query_it == query_set_.end() ? std::string{} : query_it->second.udf_path;
+}
+
+void base_client::apply_state_modification(const state_modification& mod, receive_result& out) {
     if (const auto* updated = std::get_if<query_updated>(&mod)) {
+        if (!updated->log_lines.empty()) {
+            out.log_entries.push_back(log_entry{log_entry::source_kind::query,
+                                                udf_path_for(updated->id), updated->log_lines});
+        }
         remote_results_.insert_or_assign(updated->id,
                                          function_result::success(updated->result));
         outstanding_queries_.erase(updated->id);
@@ -150,6 +161,10 @@ void base_client::apply_state_modification(const state_modification& mod) {
             query_set_.at(token_it->second).journal = updated->journal;
         }
     } else if (const auto* failed = std::get_if<query_failed>(&mod)) {
+        if (!failed->log_lines.empty()) {
+            out.log_entries.push_back(log_entry{log_entry::source_kind::query,
+                                                udf_path_for(failed->id), failed->log_lines});
+        }
         function_result r =
             failed->error_data
                 ? function_result::error(convex_error{failed->error_message, *failed->error_data})
@@ -172,7 +187,7 @@ base_client::receive_result base_client::handle_transition(const transition_mess
         return out;
     }
     for (const state_modification& mod : t.modifications) {
-        apply_state_modification(mod);
+        apply_state_modification(mod, out);
         std::visit([&out](const auto& m) { out.changed_queries.push_back(m.id); }, mod);
     }
     remote_version_ = t.end_version;
@@ -192,6 +207,12 @@ base_client::receive_result base_client::receive_message(const server_message& m
     if (const auto* m = std::get_if<mutation_response_message>(&message)) {
         const auto it = ongoing_requests_.find(m->id);
         if (it == ongoing_requests_.end()) return out;  // duplicate/stale response
+        if (!m->log_lines.empty()) {
+            const auto* req = std::get_if<mutation_request_message>(&it->second.original_message);
+            out.log_entries.push_back(log_entry{log_entry::source_kind::mutation,
+                                                req ? req->udf_path : std::string{},
+                                                m->log_lines});
+        }
         if (m->result.ok()) {
             // Hold the result until a Transition advances past its timestamp,
             // so the mutation's effects are visible before the caller learns
@@ -219,6 +240,12 @@ base_client::receive_result base_client::receive_message(const server_message& m
     if (const auto* a = std::get_if<action_response_message>(&message)) {
         const auto it = ongoing_requests_.find(a->id);
         if (it == ongoing_requests_.end()) return out;
+        if (!a->log_lines.empty()) {
+            const auto* req = std::get_if<action_request_message>(&it->second.original_message);
+            out.log_entries.push_back(log_entry{log_entry::source_kind::action,
+                                                req ? req->udf_path : std::string{},
+                                                a->log_lines});
+        }
         out.completed_requests.emplace_back(a->id, a->result);
         ongoing_requests_.erase(it);
         return out;
@@ -226,6 +253,8 @@ base_client::receive_result base_client::receive_message(const server_message& m
 
     if (const auto* e = std::get_if<auth_error_message>(&message)) {
         out.reconnect_reason = "AuthError: " + e->error;
+        out.auth_error = true;
+        out.auth_update_attempted = e->auth_update_attempted;
         return out;
     }
 
@@ -332,6 +361,20 @@ connect_message base_client::make_connect_message(std::string last_close_reason,
 const function_result* base_client::latest_result(query_id id) const {
     const auto it = remote_results_.find(id);
     return it == remote_results_.end() ? nullptr : &it->second;
+}
+
+std::size_t base_client::inflight_mutations() const {
+    return static_cast<std::size_t>(
+        std::count_if(ongoing_requests_.begin(), ongoing_requests_.end(), [](const auto& kv) {
+            return kv.second.typ == pending_request::kind::mutation;
+        }));
+}
+
+std::size_t base_client::inflight_actions() const {
+    return static_cast<std::size_t>(
+        std::count_if(ongoing_requests_.begin(), ongoing_requests_.end(), [](const auto& kv) {
+            return kv.second.typ == pending_request::kind::action;
+        }));
 }
 
 }  // namespace convex

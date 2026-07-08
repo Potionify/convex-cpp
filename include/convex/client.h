@@ -30,6 +30,23 @@ struct client_impl;
 
 enum class connection_state : std::uint8_t { disconnected, connecting, connected };
 
+/// Point-in-time snapshot of the connection for UX and telemetry
+/// ("reconnecting, attempt 3, 2 commands in flight...").
+struct connection_info {
+    connection_state state = connection_state::disconnected;
+    /// Consecutive failed/broken connection attempts since the last healthy
+    /// sync; 0 while healthy.
+    std::uint32_t retries = 0;
+    std::size_t inflight_mutations = 0;
+    std::size_t inflight_actions = 0;
+    /// True once every query re-sent by the last reconnect has a result.
+    bool has_synced_past_last_restart = false;
+    /// Why the previous connection ended ("InitialConnect" before the first).
+    std::string last_close_reason;
+    /// Connect messages sent over this client's lifetime.
+    std::uint32_t connection_count = 0;
+};
+
 /// Fetches an auth token. Called with force_refresh=true when reconnecting
 /// (the previous token may have expired). Returning nullopt keeps the
 /// current token. Called on an internal thread; must not block for long.
@@ -136,8 +153,24 @@ public:
 
     connection_state state() const;
 
+    /// Point-in-time connection snapshot (state, retries, in-flight counts,
+    /// last close reason).
+    connection_info info() const;
+
     /// Observe connection state changes (delivered like other callbacks).
     void on_state_change(std::function<void(connection_state)> listener);
+
+    /// Observe terminal authentication failure: the server rejected a token
+    /// that was already refreshed (or refreshing is impossible), so the
+    /// client stopped re-authenticating and continues unauthenticated.
+    /// Call set_auth() with a new token to try again. Delivered like other
+    /// callbacks.
+    void on_auth_failure(std::function<void(std::string reason)> listener);
+
+    /// Observe server-side console output (`console.log` in queries,
+    /// mutations, actions), attributed to the emitting function. Delivered
+    /// like other callbacks.
+    void on_log_lines(std::function<void(const log_entry&)> listener);
 
     // ------------------------------------------------------------------
     // Event pump

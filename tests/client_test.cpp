@@ -80,16 +80,10 @@ TEST(Client, ConnectHandshakeAndHeaders) {
     EXPECT_EQ(connect["lastCloseReason"], "InitialConnect");
     EXPECT_EQ(connect["sessionId"].get<std::string>().size(), 36u);
 
-    // URL and client id header.
-    ASSERT_TRUE(transport->wait_for_attempts(1));
-    // (attempt data captured at connect time)
-    // url: wss host + /api/sync
-    // header: Convex-Client
-    // Checked via the transport's recorded attempt:
-    // NOTE: sent() already proved the observer wiring works.
-    // Validate URL/headers:
-    // attempt struct is internal; re-expose via transport methods:
-    SUCCEED();
+    EXPECT_EQ(transport->url(0), "wss://unit-test.convex.cloud/api/sync");
+    const auto headers = transport->headers(0);
+    ASSERT_TRUE(headers.contains("Convex-Client"));
+    EXPECT_EQ(headers.at("Convex-Client"), "cpp-0.1.0");
 }
 
 TEST(Client, SubscribeDeliversUpdatesThroughPump) {
@@ -342,6 +336,139 @@ TEST(Client, SubscriptionHandleOutlivesClient) {
     }
     sub.unsubscribe();  // must be a harmless no-op after client destruction
     SUCCEED();
+}
+
+TEST(Client, LogLinesReachListenerWithAttribution) {
+    auto transport = std::make_shared<mock_transport>();
+    client c(make_options(transport));
+
+    std::vector<log_entry> logs;
+    c.on_log_lines([&](const log_entry& e) { logs.push_back(e); });
+
+    auto sub = c.subscribe("messages:list", {}, [](const function_result&) {});
+    ASSERT_TRUE(transport->wait_for_attempts(1));
+    transport->open(0);
+    ASSERT_TRUE(transport->wait_for_sent(0, 2));
+
+    transport->server_send(
+        0, R"({"type":"Transition","startVersion":{"querySet":0,"identity":0,"ts":")" +
+               std::string(TS0) + R"("},"endVersion":{"querySet":1,"identity":0,"ts":")" +
+               std::string(TS5) +
+               R"("},"modifications":[{"type":"QueryUpdated","queryId":0,"value":1.0,)"
+               R"("logLines":["[LOG] hello from server"]}]})");
+    ASSERT_TRUE(pump_until(c, [&] { return !logs.empty(); }));
+    EXPECT_EQ(logs[0].source, log_entry::source_kind::query);
+    EXPECT_EQ(logs[0].udf_path, "messages:list");
+    ASSERT_EQ(logs[0].lines.size(), 1u);
+    EXPECT_EQ(logs[0].lines[0], "[LOG] hello from server");
+
+    // Mutation logs arrive with the response, before the result is released.
+    auto future = c.mutation("messages:send", {});
+    ASSERT_TRUE(transport->wait_for_sent(0, 3));
+    transport->server_send(0,
+                           R"({"type":"MutationResponse","requestId":0,"success":true,)"
+                           R"("result":null,"ts":")" +
+                               std::string(TS10) + R"(","logLines":["[LOG] sending"]})");
+    ASSERT_TRUE(pump_until(c, [&] { return logs.size() >= 2; }));
+    EXPECT_EQ(logs[1].source, log_entry::source_kind::mutation);
+    EXPECT_EQ(logs[1].udf_path, "messages:send");
+    EXPECT_EQ(future.wait_for(0ms), std::future_status::timeout);
+}
+
+TEST(Client, AuthFailureTerminalWhenRefreshedTokenRejected) {
+    auto transport = std::make_shared<mock_transport>();
+    client c(make_options(transport));
+
+    std::vector<std::string> failures;
+    c.on_auth_failure([&](std::string reason) { failures.push_back(std::move(reason)); });
+
+    // A fetcher exists, so the first AuthError only forces a refresh+retry.
+    c.set_auth(auth_token::user("expiring-jwt"),
+               [](bool) { return auth_token::user("refreshed-jwt"); });
+
+    ASSERT_TRUE(transport->wait_for_attempts(1));
+    transport->open(0);
+    ASSERT_TRUE(transport->wait_for_sent(0, 2));  // Connect + Authenticate
+
+    transport->server_send(0, R"({"type":"AuthError","error":"expired"})");
+    ASSERT_TRUE(transport->wait_for_attempts(2));
+    transport->open(1);
+    ASSERT_TRUE(transport->wait_for_sent(1, 2));
+    const json reauth = json::parse(transport->sent(1)[1]);
+    EXPECT_EQ(reauth["type"], "Authenticate");
+    EXPECT_EQ(reauth["value"], "refreshed-jwt");
+    c.process_events();
+    EXPECT_TRUE(failures.empty()) << "first AuthError must not be terminal when a fetcher exists";
+
+    // The refreshed token is rejected too: terminal. The client reports the
+    // failure and reconnects unauthenticated.
+    transport->server_send(1, R"({"type":"AuthError","error":"still expired",)"
+                              R"("baseVersion":0,"authUpdateAttempted":true})");
+    ASSERT_TRUE(pump_until(c, [&] { return !failures.empty(); }));
+    EXPECT_NE(failures[0].find("still expired"), std::string::npos);
+
+    ASSERT_TRUE(transport->wait_for_attempts(3));
+    transport->open(2);
+    ASSERT_TRUE(transport->wait_for_sent(2, 1));
+    for (const std::string& frame : transport->sent(2)) {
+        EXPECT_EQ(json::parse(frame)["type"], "Connect")
+            << "no Authenticate may be sent after terminal auth failure";
+    }
+
+    // A fresh set_auth gives authentication another chance.
+    c.set_auth(auth_token::user("brand-new-jwt"));
+    ASSERT_TRUE(transport->wait_for_sent(2, 2));
+    EXPECT_EQ(json::parse(transport->sent(2)[1])["type"], "Authenticate");
+}
+
+TEST(Client, AuthFailureTerminalImmediatelyWithoutFetcher) {
+    auto transport = std::make_shared<mock_transport>();
+    client c(make_options(transport));
+
+    std::vector<std::string> failures;
+    c.on_auth_failure([&](std::string reason) { failures.push_back(std::move(reason)); });
+    c.set_auth(auth_token::user("static-jwt"));  // no fetcher: cannot ever recover
+
+    ASSERT_TRUE(transport->wait_for_attempts(1));
+    transport->open(0);
+    ASSERT_TRUE(transport->wait_for_sent(0, 2));
+    transport->server_send(0, R"({"type":"AuthError","error":"bad token"})");
+    ASSERT_TRUE(pump_until(c, [&] { return !failures.empty(); }));
+
+    ASSERT_TRUE(transport->wait_for_attempts(2));
+    transport->open(1);
+    ASSERT_TRUE(transport->wait_for_sent(1, 1));
+    for (const std::string& frame : transport->sent(1)) {
+        EXPECT_EQ(json::parse(frame)["type"], "Connect");
+    }
+}
+
+TEST(Client, InfoSnapshotTracksConnectionAndInflight) {
+    auto transport = std::make_shared<mock_transport>();
+    client c(make_options(transport));
+
+    ASSERT_TRUE(transport->wait_for_attempts(1));
+    transport->open(0);
+    ASSERT_TRUE(transport->wait_for_sent(0, 1));
+
+    connection_info i = c.info();
+    EXPECT_EQ(i.state, connection_state::connected);
+    EXPECT_EQ(i.last_close_reason, "InitialConnect");
+    EXPECT_EQ(i.connection_count, 1u);
+    EXPECT_EQ(i.inflight_mutations, 0u);
+
+    auto future = c.mutation("messages:send", {});
+    ASSERT_TRUE(transport->wait_for_sent(0, 2));
+    i = c.info();
+    EXPECT_EQ(i.inflight_mutations, 1u);
+    EXPECT_EQ(i.inflight_actions, 0u);
+
+    transport->server_close(0, "server going away");
+    ASSERT_TRUE(transport->wait_for_attempts(2));
+    i = c.info();
+    EXPECT_EQ(i.last_close_reason, "server going away");
+    EXPECT_GE(i.retries, 1u);
+    EXPECT_EQ(i.inflight_mutations, 1u) << "mutations survive reconnects";
 }
 
 TEST(WsUrl, Derivation) {

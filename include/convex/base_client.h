@@ -31,6 +31,17 @@ struct subscriber_id {
     friend auto operator<=>(const subscriber_id&, const subscriber_id&) = default;
 };
 
+/// Server-side console output (`console.log` etc.) produced by one function
+/// execution, attributed to the function that emitted it. Log lines are
+/// per-execution events, not state: they are delivered once and never stored
+/// or replayed with query results.
+struct log_entry {
+    enum class source_kind : std::uint8_t { query, mutation, action };
+    source_kind source = source_kind::query;
+    std::string udf_path;  // canonical; empty when the source is unknown
+    std::vector<std::string> lines;
+};
+
 class base_client {
 public:
     base_client() = default;
@@ -71,10 +82,18 @@ public:
         /// timestamp (read-your-writes); failed mutations and all actions
         /// complete immediately.
         std::vector<std::pair<request_id, function_result>> completed_requests;
+        /// Server console output carried by this message, if any.
+        std::vector<log_entry> log_entries;
         /// When set, the connection is broken (protocol violation, auth or
         /// fatal error): the caller must tear down the transport, then call
         /// restart() and reconnect.
         std::optional<std::string> reconnect_reason;
+        /// True when reconnect_reason is an AuthError. auth_update_attempted
+        /// mirrors the server flag: the rejected identity already reflected
+        /// our most recent Authenticate, so retrying with the same token is
+        /// pointless (the caller should stop re-authenticating).
+        bool auth_error = false;
+        bool auth_update_attempted = false;
     };
 
     /// Feed one decoded server message.
@@ -122,6 +141,13 @@ public:
     const std::string& session_id() const { return session_id_; }
     std::optional<timestamp> max_observed_timestamp() const { return max_observed_timestamp_; }
 
+    /// In-flight request counts, by kind.
+    std::size_t inflight_mutations() const;
+    std::size_t inflight_actions() const;
+
+    /// Number of Connect messages built so far (0 before the first attempt).
+    std::uint32_t connection_count() const { return connection_count_; }
+
     /// True once every query re-sent by the last restart() has received a
     /// result — the signal that reconnect backoff can reset.
     bool has_synced_past_last_restart() const { return outstanding_queries_.empty(); }
@@ -145,7 +171,8 @@ private:
     };
 
     receive_result handle_transition(const transition_message& t);
-    void apply_state_modification(const state_modification& mod);
+    void apply_state_modification(const state_modification& mod, receive_result& out);
+    std::string udf_path_for(query_id id) const;
     void enqueue_authenticate();
     void observe_timestamp(timestamp ts);
     /// Completed mutations whose ts <= watermark become deliverable.

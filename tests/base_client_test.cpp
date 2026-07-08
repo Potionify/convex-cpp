@@ -218,6 +218,119 @@ TEST(Errors, AuthAndFatalForceReconnect) {
     EXPECT_FALSE(c.receive_message(ping_message{}).reconnect_reason.has_value());
 }
 
+TEST(Errors, AuthErrorCarriesUpdateAttemptedFlag) {
+    base_client c;
+    auto plain = c.receive_message(auth_error_message{"bad", std::nullopt, false});
+    EXPECT_TRUE(plain.auth_error);
+    EXPECT_FALSE(plain.auth_update_attempted);
+
+    auto attempted = c.receive_message(auth_error_message{"still bad", identity_version{1}, true});
+    EXPECT_TRUE(attempted.auth_error);
+    EXPECT_TRUE(attempted.auth_update_attempted);
+
+    auto fatal = c.receive_message(fatal_error_message{"dead"});
+    EXPECT_FALSE(fatal.auth_error);
+}
+
+// -------------------------------------------------------------- log lines
+
+TEST(LogLines, QueryLogsAttributedToUdfPathAndNotReplayed) {
+    base_client c;
+    const auto sub = c.subscribe("messages:list", {{"channel", value("general")}});
+    (void)expect_message<modify_query_set_message>(c);
+
+    query_updated u = updated(sub.query, value(1.0));
+    u.log_lines = {"[LOG] first", "[LOG] second"};
+    auto r = c.receive_message(make_transition({0, 0, 0}, {1, 0, 5}, {u}));
+    ASSERT_EQ(r.log_entries.size(), 1u);
+    EXPECT_EQ(r.log_entries[0].source, log_entry::source_kind::query);
+    EXPECT_EQ(r.log_entries[0].udf_path, "messages:list");
+    EXPECT_EQ(r.log_entries[0].lines, (std::vector<std::string>{"[LOG] first", "[LOG] second"}));
+
+    // Log lines are per-execution events: an update without them emits none,
+    // and nothing from the previous update is replayed.
+    auto r2 = c.receive_message(
+        make_transition({1, 0, 5}, {1, 0, 6}, {updated(sub.query, value(2.0))}));
+    EXPECT_TRUE(r2.log_entries.empty());
+}
+
+TEST(LogLines, QueryFailureLogsAttributed) {
+    base_client c;
+    const auto sub = c.subscribe("errors:throwConvexError", {});
+    (void)expect_message<modify_query_set_message>(c);
+
+    query_failed f;
+    f.id = sub.query;
+    f.error_message = "boom";
+    f.log_lines = {"[ERROR] about to throw"};
+    auto r = c.receive_message(make_transition({0, 0, 0}, {1, 0, 3}, {f}));
+    ASSERT_EQ(r.log_entries.size(), 1u);
+    EXPECT_EQ(r.log_entries[0].source, log_entry::source_kind::query);
+    EXPECT_EQ(r.log_entries[0].udf_path, "errors:throwConvexError");
+}
+
+TEST(LogLines, MutationLogsDeliveredEvenWhileResultIsGated) {
+    base_client c;
+    const request_id rid = c.mutation("messages:send", {{"body", value("hi")}});
+    (void)expect_message<mutation_request_message>(c);
+
+    mutation_response_message resp;
+    resp.id = rid;
+    resp.result = function_result::success(value(nullptr));
+    resp.ts = timestamp{10};
+    resp.log_lines = {"[LOG] sent"};
+    auto r = c.receive_message(resp);
+    // The result is held for the watermark, but the log lines arrive now.
+    EXPECT_TRUE(r.completed_requests.empty());
+    ASSERT_EQ(r.log_entries.size(), 1u);
+    EXPECT_EQ(r.log_entries[0].source, log_entry::source_kind::mutation);
+    EXPECT_EQ(r.log_entries[0].udf_path, "messages:send");
+}
+
+TEST(LogLines, ActionLogsAttributed) {
+    base_client c;
+    const request_id rid = c.action("actions:echoAction", {});
+    (void)expect_message<action_request_message>(c);
+
+    action_response_message resp;
+    resp.id = rid;
+    resp.result = function_result::success(value("done"));
+    resp.log_lines = {"[LOG] echoed"};
+    auto r = c.receive_message(resp);
+    ASSERT_EQ(r.log_entries.size(), 1u);
+    EXPECT_EQ(r.log_entries[0].source, log_entry::source_kind::action);
+    EXPECT_EQ(r.log_entries[0].udf_path, "actions:echoAction");
+}
+
+// ---------------------------------------------------------- introspection
+
+TEST(Introspection, InflightCountsTrackRequestLifecycles) {
+    base_client c;
+    EXPECT_EQ(c.inflight_mutations(), 0u);
+    EXPECT_EQ(c.inflight_actions(), 0u);
+
+    const request_id mut = c.mutation("messages:send", {});
+    const request_id act = c.action("actions:echoAction", {});
+    EXPECT_EQ(c.inflight_mutations(), 1u);
+    EXPECT_EQ(c.inflight_actions(), 1u);
+
+    action_response_message aresp;
+    aresp.id = act;
+    aresp.result = function_result::success(value(nullptr));
+    (void)c.receive_message(aresp);
+    EXPECT_EQ(c.inflight_actions(), 0u);
+
+    // A gated mutation still counts as in flight until it is delivered.
+    mutation_response_message mresp;
+    mresp.id = mut;
+    mresp.result = function_result::success(value(nullptr));
+    mresp.ts = timestamp{10};
+    (void)c.receive_message(mresp);
+    EXPECT_EQ(c.inflight_mutations(), 1u);
+    (void)c.receive_message(make_transition({0, 0, 0}, {0, 0, 10}));
+    EXPECT_EQ(c.inflight_mutations(), 0u);
+}
+
 // ------------------------------------------------------------------- auth
 
 TEST(Auth, VersionsIncrementPerAuthenticate) {

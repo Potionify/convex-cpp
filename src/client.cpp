@@ -103,6 +103,9 @@ struct client_impl : std::enable_shared_from_this<client_impl> {
     std::map<query_id, std::vector<sub_entry>> subs;
     std::map<request_id, client::result_callback> pending;
     std::vector<std::function<void(connection_state)>> state_listeners;
+    std::vector<std::function<void(std::string)>> auth_failure_listeners;
+    std::vector<std::function<void(const log_entry&)>> log_listeners;
+    std::uint32_t consecutive_auth_errors = 0;
 
     std::deque<std::function<void()>> event_queue;
 
@@ -245,7 +248,30 @@ struct client_impl : std::enable_shared_from_this<client_impl> {
             }
 
             auto r = base.receive_message(msg);
+            for (const log_entry& entry : r.log_entries) {
+                for (const auto& listener : log_listeners) {
+                    out.push_back([listener, entry] { listener(entry); });
+                }
+            }
             if (r.reconnect_reason) {
+                if (r.auth_error) {
+                    // A refreshed token that is rejected again (or a static
+                    // token with no way to refresh) can never succeed: stop
+                    // re-authenticating instead of hammering the server, and
+                    // continue unauthenticated.
+                    ++consecutive_auth_errors;
+                    const bool terminal =
+                        r.auth_update_attempted || !fetcher || consecutive_auth_errors >= 2;
+                    if (terminal) {
+                        base.set_auth(auth_token::none());
+                        fetcher = nullptr;
+                        consecutive_auth_errors = 0;
+                        for (const auto& listener : auth_failure_listeners) {
+                            out.push_back(
+                                [listener, reason = *r.reconnect_reason] { listener(reason); });
+                        }
+                    }
+                }
                 begin_disconnect(out, *r.reconnect_reason);
             } else {
                 for (const query_id qid : r.changed_queries) {
@@ -268,6 +294,7 @@ struct client_impl : std::enable_shared_from_this<client_impl> {
                 }
                 if (r.state_changed && base.has_synced_past_last_restart()) {
                     retries = 0;  // healthy again: reset backoff
+                    consecutive_auth_errors = 0;
                 }
                 drain_outgoing();
             }
@@ -451,6 +478,7 @@ struct client_impl : std::enable_shared_from_this<client_impl> {
         std::lock_guard lk(mu);
         if (stopping) return;
         fetcher = std::move(f);
+        consecutive_auth_errors = 0;  // a new token gets a fresh chance
         base.set_auth(std::move(token));
         drain_outgoing();
     }
@@ -594,9 +622,32 @@ connection_state client::state() const {
     return impl_->state;
 }
 
+connection_info client::info() const {
+    std::lock_guard lk(impl_->mu);
+    connection_info i;
+    i.state = impl_->state;
+    i.retries = impl_->retries;
+    i.inflight_mutations = impl_->base.inflight_mutations();
+    i.inflight_actions = impl_->base.inflight_actions();
+    i.has_synced_past_last_restart = impl_->base.has_synced_past_last_restart();
+    i.last_close_reason = impl_->last_close_reason;
+    i.connection_count = impl_->base.connection_count();
+    return i;
+}
+
 void client::on_state_change(std::function<void(connection_state)> listener) {
     std::lock_guard lk(impl_->mu);
     impl_->state_listeners.push_back(std::move(listener));
+}
+
+void client::on_auth_failure(std::function<void(std::string)> listener) {
+    std::lock_guard lk(impl_->mu);
+    impl_->auth_failure_listeners.push_back(std::move(listener));
+}
+
+void client::on_log_lines(std::function<void(const log_entry&)> listener) {
+    std::lock_guard lk(impl_->mu);
+    impl_->log_listeners.push_back(std::move(listener));
 }
 
 std::size_t client::process_events() { return impl_->do_process_events(); }

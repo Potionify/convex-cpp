@@ -66,6 +66,16 @@ public:
         return attempts_.at(index)->sent;
     }
 
+    std::string url(std::size_t index) {
+        std::lock_guard lk(mu_);
+        return attempts_.at(index)->url;
+    }
+
+    std::map<std::string, std::string> headers(std::size_t index) {
+        std::lock_guard lk(mu_);
+        return attempts_.at(index)->headers;
+    }
+
     /// Block until attempt `index` has sent at least `count` frames.
     bool wait_for_sent(std::size_t index, std::size_t count,
                        std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
