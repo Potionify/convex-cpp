@@ -3,6 +3,7 @@
 // (src/values/value.ts): $integer/$float/$bytes wrap base64 of 8
 // little-endian bytes; $float only for NaN, +/-Infinity and -0.0.
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -64,6 +65,18 @@ TEST(WireEncode, Int64) {
     EXPECT_EQ(to_wire_json(value(42)), R"({"$integer":"KgAAAAAAAAA="})");
     EXPECT_EQ(to_wire_json(value(std::uint32_t{7u})),
               to_wire_json(value(std::int64_t{7})));
+}
+
+TEST(WireEncode, NaNPayloadsAreCanonicalized) {
+    // Computed NaNs on x86-64 carry the negative pattern 0xFFF8...; JS
+    // engines emit the canonical quiet NaN 0x7FF8.... Every NaN must encode
+    // to the same canonical bytes so query-identity tokens are deterministic.
+    const double negative_nan = std::bit_cast<double>(std::uint64_t{0xFFF8000000000000ULL});
+    const double payload_nan = std::bit_cast<double>(std::uint64_t{0x7FF0000000000001ULL});
+    ASSERT_TRUE(std::isnan(negative_nan));
+    ASSERT_TRUE(std::isnan(payload_nan));
+    EXPECT_EQ(to_wire_json(value(negative_nan)), R"({"$float":"AAAAAAAA+H8="})");
+    EXPECT_EQ(to_wire_json(value(payload_nan)), R"({"$float":"AAAAAAAA+H8="})");
 }
 
 TEST(WireEncode, SpecialFloats) {

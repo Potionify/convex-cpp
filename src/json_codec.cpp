@@ -57,6 +57,18 @@ bool is_special_float(double d) {
     return !std::isfinite(d) || (d == 0.0 && std::signbit(d));
 }
 
+// Canonicalize NaN payloads on encode: computed NaNs on x86-64 carry the
+// negative pattern 0xFFF8..., while JS engines (and therefore convex-js)
+// always emit the canonical quiet NaN 0x7FF8.... Any payload is semantically
+// NaN, but canonical bytes keep encodings — and the query-identity tokens
+// derived from them — deterministic across NaN provenance and clients.
+double canonicalize_if_nan(double d) {
+    if (std::isnan(d)) {
+        return std::bit_cast<double>(std::uint64_t{0x7FF8000000000000ULL});
+    }
+    return d;
+}
+
 }  // namespace
 
 std::string int64_to_le_base64(std::int64_t n) {
@@ -114,7 +126,9 @@ nlohmann::json value_to_json(const value& v) {
             return json{{"$integer", int64_to_le_base64(v.as_int64())}};
         case value::kind::float64: {
             const double d = v.as_float64();
-            if (is_special_float(d)) return json{{"$float", double_to_le_base64(d)}};
+            if (is_special_float(d)) {
+                return json{{"$float", double_to_le_base64(canonicalize_if_nan(d))}};
+            }
             return d;
         }
         case value::kind::string:
