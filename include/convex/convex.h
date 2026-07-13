@@ -8,6 +8,7 @@
 #include <convex/file_storage.h>
 #include <convex/http_client.h>
 #include <convex/json_codec.h>
+#include <convex/paginated.h>
 #include <convex/protocol.h>
 #include <convex/transport.h>
 #include <convex/value.h>

@@ -7,6 +7,11 @@ details cross-checked against [convex-js](https://github.com/get-convex/convex-j
 - **Realtime sync client** (`convex::client`): WebSocket sync protocol with
   live query subscriptions, ordered mutations (read-your-writes), actions,
   authentication, and automatic reconnection with jittered backoff.
+- **Pagination helper** (`convex::paginated_query`): a growing, live-updating
+  list over a paginated query — the convex-js `usePaginatedQuery` state
+  machine (one live subscription per page, `load_more`, seam-free page
+  boundaries via query journals, resets on argument changes and stale
+  cursors).
 - **HTTP client** (`convex::http_client`): one-shot queries/mutations/actions
   over plain HTTP, plus file storage upload/download helpers.
 - **Sans-IO core**: the protocol state machine (`convex::base_client`) does no
