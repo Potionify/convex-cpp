@@ -324,9 +324,55 @@ server_message decode_server_message(std::string_view json_text) {
 
     if (type == "Ping") return ping_message{};
 
-    // TransitionChunk is only enabled for npm clients; anything else is
-    // unknown. Either way the caller should reconnect.
+    if (type == "TransitionChunk") {
+        transition_chunk_message c;
+        c.chunk = require_string(j, "chunk", "TransitionChunk");
+        c.part_number = require_u32(j, "partNumber", "TransitionChunk");
+        c.total_parts = require_u32(j, "totalParts", "TransitionChunk");
+        c.transition_id = require_string(j, "transitionId", "TransitionChunk");
+        return c;
+    }
+
     throw protocol_error("unsupported server message type '" + type + "'");
+}
+
+std::optional<transition_message> transition_chunk_assembler::feed(
+    const transition_chunk_message& chunk) {
+    if (chunk.total_parts == 0 || chunk.part_number >= chunk.total_parts ||
+        (buffering() && (total_parts_ != chunk.total_parts ||
+                         transition_id_ != chunk.transition_id))) {
+        abandon();
+        throw protocol_error("TransitionChunk: inconsistent chunk parameters");
+    }
+    if (chunk.part_number != received_parts_) {
+        abandon();
+        throw protocol_error("TransitionChunk: part " + std::to_string(chunk.part_number) +
+                             " received out of order (expected " +
+                             std::to_string(received_parts_) + ")");
+    }
+    if (!buffering()) {
+        total_parts_ = chunk.total_parts;
+        transition_id_ = chunk.transition_id;
+    }
+    data_ += chunk.chunk;
+    ++received_parts_;
+    if (received_parts_ < total_parts_) return std::nullopt;
+
+    const std::string full = std::move(data_);
+    abandon();
+    server_message assembled = decode_server_message(full);  // may throw
+    auto* t = std::get_if<transition_message>(&assembled);
+    if (t == nullptr) {
+        throw protocol_error("TransitionChunk: assembled message is not a Transition");
+    }
+    return std::move(*t);
+}
+
+void transition_chunk_assembler::abandon() {
+    data_.clear();
+    received_parts_ = 0;
+    total_parts_ = 0;
+    transition_id_.clear();
 }
 
 std::string generate_session_id() {

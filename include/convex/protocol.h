@@ -180,14 +180,54 @@ struct fatal_error_message {
 
 struct ping_message {};
 
+/// One slice of a Transition too large for a single frame (> 5 MB). Chunks
+/// are consecutive substrings of the serialized Transition JSON, sent in
+/// order; transition_id identifies one split so mixed sequences can be
+/// detected. The server only splits for clients that advertise support
+/// (currently npm >= a minimum version, keyed off the client-version path
+/// segment of the sync URL), but decoding and reassembly are implemented so
+/// a chunk never kills the connection.
+struct transition_chunk_message {
+    std::string chunk;
+    std::uint32_t part_number = 0;  // 0-based
+    std::uint32_t total_parts = 0;
+    std::string transition_id;
+};
+
 using server_message =
     std::variant<transition_message, mutation_response_message, action_response_message,
-                 auth_error_message, fatal_error_message, ping_message>;
+                 auth_error_message, fatal_error_message, ping_message,
+                 transition_chunk_message>;
 
 /// Decode a server wire JSON text. Throws protocol_error on malformed input
-/// or unsupported message types (e.g. TransitionChunk, which the server only
-/// sends to npm clients).
+/// or unknown message types.
 server_message decode_server_message(std::string_view json_text);
+
+/// Reassembles TransitionChunk slices into a full Transition. Per-connection
+/// state: feed every chunk as it arrives; a non-chunk message other than Ping
+/// arriving mid-sequence means the buffer is stale (call abandon()), and the
+/// buffer never survives a reconnect. Mirrors convex-js's assembleTransition.
+class transition_chunk_assembler {
+public:
+    /// Consume one chunk. Returns the assembled Transition when the final
+    /// part arrives, std::nullopt while parts are missing. Throws
+    /// protocol_error — after discarding the buffer — on inconsistent or
+    /// out-of-order parts, or when the assembled document is not a
+    /// Transition.
+    std::optional<transition_message> feed(const transition_chunk_message& chunk);
+
+    /// Discard any partial buffer (interleaved message or reconnect).
+    void abandon();
+
+    /// True while a split Transition is partially received.
+    bool buffering() const { return total_parts_ != 0; }
+
+private:
+    std::string data_;
+    std::uint32_t received_parts_ = 0;
+    std::uint32_t total_parts_ = 0;  // 0 = idle
+    std::string transition_id_;
+};
 
 // --------------------------------------------------------------------------
 

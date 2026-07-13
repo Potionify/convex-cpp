@@ -63,6 +63,22 @@ std::string transition_empty(int qs, const char* start_ts, const char* end_ts) {
            std::to_string(qs) + R"(,"identity":0,"ts":")" + end_ts + R"("},"modifications":[]})";
 }
 
+// Split a Transition into TransitionChunk frames the way the server does:
+// consecutive slices of the serialized JSON, transitionId = total length.
+std::vector<std::string> chunk_frames(const std::string& transition_json, std::size_t parts) {
+    std::vector<std::string> frames;
+    const std::size_t chunk_size = (transition_json.size() + parts - 1) / parts;
+    for (std::size_t i = 0; i < parts; ++i) {
+        const json frame{{"type", "TransitionChunk"},
+                         {"chunk", transition_json.substr(i * chunk_size, chunk_size)},
+                         {"partNumber", i},
+                         {"totalParts", parts},
+                         {"transitionId", std::to_string(transition_json.size())}};
+        frames.push_back(frame.dump());
+    }
+    return frames;
+}
+
 }  // namespace
 
 TEST(Client, ConnectHandshakeAndHeaders) {
@@ -119,6 +135,63 @@ TEST(Client, SubscribeDeliversUpdatesThroughPump) {
     ASSERT_TRUE(pump_until(c, [&] { return !second.empty(); }));
     EXPECT_EQ(second[0].get_value(), value(std::int64_t{42}));
     EXPECT_EQ(transport->sent(0).size(), 2u);
+}
+
+TEST(Client, ChunkedTransitionReassembledAcrossFrames) {
+    auto transport = std::make_shared<mock_transport>();
+    client c(make_options(transport));
+
+    std::vector<function_result> updates;
+    auto sub = c.subscribe("messages:list", {{"channel", value("general")}},
+                           [&](const function_result& r) { updates.push_back(r); });
+
+    ASSERT_TRUE(transport->wait_for_attempts(1));
+    transport->open(0);
+    ASSERT_TRUE(transport->wait_for_sent(0, 2));  // Connect + ModifyQuerySet
+
+    const std::string full =
+        transition_updated(0, TS0, 1, TS5, 0, R"({"$integer":"KgAAAAAAAAA="})");
+    const auto frames = chunk_frames(full, 3);
+    transport->server_send(0, frames[0]);
+    // The server's keepalive timer may interleave a Ping mid-split; it must
+    // not poison the chunk buffer.
+    transport->server_send(0, R"({"type":"Ping"})");
+    transport->server_send(0, frames[1]);
+    transport->server_send(0, frames[2]);
+
+    ASSERT_TRUE(pump_until(c, [&] { return !updates.empty(); }));
+    ASSERT_TRUE(updates[0].ok());
+    EXPECT_EQ(updates[0].get_value(), value(std::int64_t{42}));
+    EXPECT_EQ(transport->attempt_count(), 1u) << "reassembly must not trigger a reconnect";
+}
+
+TEST(Client, InterleavedMessageDropsPartialChunkBufferWithoutDisconnect) {
+    auto transport = std::make_shared<mock_transport>();
+    client c(make_options(transport));
+
+    std::vector<function_result> updates;
+    auto sub = c.subscribe("messages:list", {{"channel", value("general")}},
+                           [&](const function_result& r) { updates.push_back(r); });
+
+    ASSERT_TRUE(transport->wait_for_attempts(1));
+    transport->open(0);
+    ASSERT_TRUE(transport->wait_for_sent(0, 2));
+
+    const std::string full =
+        transition_updated(0, TS0, 1, TS5, 0, R"({"$integer":"KgAAAAAAAAA="})");
+    const auto frames = chunk_frames(full, 2);
+
+    // A whole message mid-split abandons the stale buffer (mirrors convex-js)…
+    transport->server_send(0, frames[0]);
+    transport->server_send(0, transition_empty(0, TS0, TS0));
+
+    // …after which a clean split from part 0 assembles normally.
+    transport->server_send(0, frames[0]);
+    transport->server_send(0, frames[1]);
+
+    ASSERT_TRUE(pump_until(c, [&] { return !updates.empty(); }));
+    EXPECT_EQ(updates[0].get_value(), value(std::int64_t{42}));
+    EXPECT_EQ(transport->attempt_count(), 1u);
 }
 
 TEST(Client, MutationResultWaitsForTransitionWatermark) {

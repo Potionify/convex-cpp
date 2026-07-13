@@ -218,6 +218,15 @@ TEST(Errors, AuthAndFatalForceReconnect) {
     EXPECT_FALSE(c.receive_message(ping_message{}).reconnect_reason.has_value());
 }
 
+TEST(Errors, UnassembledTransitionChunkForcesReconnect) {
+    // Chunks are reassembled by the transport layer; the state machine treats
+    // a raw chunk as a protocol violation rather than corrupting query state.
+    base_client c;
+    auto r = c.receive_message(transition_chunk_message{"{}", 0, 1, "2"});
+    ASSERT_TRUE(r.reconnect_reason.has_value());
+    EXPECT_EQ(*r.reconnect_reason, "ProtocolError: unassembled TransitionChunk");
+}
+
 TEST(Errors, AuthErrorCarriesUpdateAttemptedFlag) {
     base_client c;
     auto plain = c.receive_message(auth_error_message{"bad", std::nullopt, false});

@@ -190,11 +190,23 @@ TEST(ServerDecode, Errors) {
     EXPECT_TRUE(std::holds_alternative<ping_message>(ping));
 }
 
+TEST(ServerDecode, TransitionChunk) {
+    const auto msg = decode_server_message(
+        R"({"type":"TransitionChunk","chunk":"{\"type\":","partNumber":0,)"
+        R"("totalParts":3,"transitionId":"12345"})");
+    const auto& c = std::get<transition_chunk_message>(msg);
+    EXPECT_EQ(c.chunk, R"({"type":)");
+    EXPECT_EQ(c.part_number, 0u);
+    EXPECT_EQ(c.total_parts, 3u);
+    EXPECT_EQ(c.transition_id, "12345");
+}
+
 TEST(ServerDecode, Malformed) {
     EXPECT_THROW(decode_server_message("not json"), protocol_error);
     EXPECT_THROW(decode_server_message(R"({"noType":1})"), protocol_error);
     EXPECT_THROW(decode_server_message(R"({"type":"TransitionChunk","chunk":"x"})"),
-                 protocol_error);
+                 protocol_error)
+        << "chunk without partNumber/totalParts/transitionId must be rejected";
     EXPECT_THROW(decode_server_message(R"({"type":"MutationResponse","requestId":1})"),
                  protocol_error);
     EXPECT_THROW(decode_server_message(
@@ -203,6 +215,134 @@ TEST(ServerDecode, Malformed) {
                      R"("ts":"AAAAAAAAAAA="},"modifications":[]})"),
                  protocol_error)
         << "numeric timestamps must be rejected (wire uses base64 strings)";
+}
+
+// ------------------------------------------------- chunk reassembly
+
+namespace {
+
+constexpr const char* kTransitionJson =
+    R"({"type":"Transition",)"
+    R"("startVersion":{"querySet":0,"identity":0,"ts":"AAAAAAAAAAA="},)"
+    R"("endVersion":{"querySet":1,"identity":0,"ts":"AQAAAAAAAAA="},)"
+    R"("modifications":[{"type":"QueryUpdated","queryId":7,)"
+    R"("value":{"$integer":"KgAAAAAAAAA="},"logLines":[],"journal":null}]})";
+
+// Split like the server does: consecutive slices of the serialized JSON,
+// transition_id = total length as a string.
+std::vector<transition_chunk_message> split_transition(std::string_view json,
+                                                       std::size_t parts) {
+    std::vector<transition_chunk_message> chunks;
+    const std::size_t chunk_size = (json.size() + parts - 1) / parts;
+    for (std::size_t i = 0; i < parts; ++i) {
+        transition_chunk_message c;
+        c.chunk = std::string(json.substr(i * chunk_size, chunk_size));
+        c.part_number = static_cast<std::uint32_t>(i);
+        c.total_parts = static_cast<std::uint32_t>(parts);
+        c.transition_id = std::to_string(json.size());
+        chunks.push_back(std::move(c));
+    }
+    return chunks;
+}
+
+}  // namespace
+
+TEST(ChunkAssembler, ReassemblesInOrder) {
+    transition_chunk_assembler assembler;
+    const auto chunks = split_transition(kTransitionJson, 3);
+
+    EXPECT_FALSE(assembler.feed(chunks[0]).has_value());
+    EXPECT_TRUE(assembler.buffering());
+    EXPECT_FALSE(assembler.feed(chunks[1]).has_value());
+
+    const auto assembled = assembler.feed(chunks[2]);
+    ASSERT_TRUE(assembled.has_value());
+    EXPECT_FALSE(assembler.buffering());
+    EXPECT_EQ(assembled->end_version, (state_version{1, 0, 1}));
+    ASSERT_EQ(assembled->modifications.size(), 1u);
+    EXPECT_EQ(std::get<query_updated>(assembled->modifications[0]).result,
+              value(std::int64_t{42}));
+}
+
+TEST(ChunkAssembler, SinglePartCompletesImmediately) {
+    transition_chunk_assembler assembler;
+    const auto chunks = split_transition(kTransitionJson, 1);
+    const auto assembled = assembler.feed(chunks[0]);
+    ASSERT_TRUE(assembled.has_value());
+    EXPECT_EQ(assembled->end_version, (state_version{1, 0, 1}));
+}
+
+TEST(ChunkAssembler, RejectsOutOfOrderAndRecovers) {
+    transition_chunk_assembler assembler;
+    const auto chunks = split_transition(kTransitionJson, 3);
+
+    // First part must be part 0.
+    EXPECT_THROW(assembler.feed(chunks[1]), protocol_error);
+    EXPECT_FALSE(assembler.buffering());
+
+    // Skipping a part clears the buffer...
+    EXPECT_FALSE(assembler.feed(chunks[0]).has_value());
+    EXPECT_THROW(assembler.feed(chunks[2]), protocol_error);
+    EXPECT_FALSE(assembler.buffering());
+
+    // ...after which a clean sequence still assembles.
+    EXPECT_FALSE(assembler.feed(chunks[0]).has_value());
+    EXPECT_FALSE(assembler.feed(chunks[1]).has_value());
+    EXPECT_TRUE(assembler.feed(chunks[2]).has_value());
+}
+
+TEST(ChunkAssembler, RejectsInconsistentParameters) {
+    transition_chunk_assembler assembler;
+    const auto chunks = split_transition(kTransitionJson, 2);
+
+    transition_chunk_message zero = chunks[0];
+    zero.total_parts = 0;
+    zero.part_number = 0;
+    EXPECT_THROW(assembler.feed(zero), protocol_error);
+
+    transition_chunk_message oob = chunks[0];
+    oob.part_number = 2;  // >= total_parts
+    EXPECT_THROW(assembler.feed(oob), protocol_error);
+
+    // A chunk from a different split (id mismatch) poisons the buffer.
+    EXPECT_FALSE(assembler.feed(chunks[0]).has_value());
+    transition_chunk_message other = chunks[1];
+    other.transition_id = "different";
+    EXPECT_THROW(assembler.feed(other), protocol_error);
+    EXPECT_FALSE(assembler.buffering());
+
+    // Same for a totalParts mismatch.
+    EXPECT_FALSE(assembler.feed(chunks[0]).has_value());
+    transition_chunk_message wrong_total = chunks[1];
+    wrong_total.total_parts = 5;
+    EXPECT_THROW(assembler.feed(wrong_total), protocol_error);
+    EXPECT_FALSE(assembler.buffering());
+}
+
+TEST(ChunkAssembler, RejectsNonTransitionPayload) {
+    transition_chunk_assembler assembler;
+    const auto chunks = split_transition(R"({"type":"Ping"})", 2);
+    EXPECT_FALSE(assembler.feed(chunks[0]).has_value());
+    EXPECT_THROW(assembler.feed(chunks[1]), protocol_error);
+    EXPECT_FALSE(assembler.buffering());
+
+    const auto garbage = split_transition("not json at all!!", 2);
+    EXPECT_FALSE(assembler.feed(garbage[0]).has_value());
+    EXPECT_THROW(assembler.feed(garbage[1]), protocol_error);
+}
+
+TEST(ChunkAssembler, AbandonDiscardsPartialBuffer) {
+    transition_chunk_assembler assembler;
+    const auto chunks = split_transition(kTransitionJson, 2);
+    EXPECT_FALSE(assembler.feed(chunks[0]).has_value());
+    EXPECT_TRUE(assembler.buffering());
+
+    assembler.abandon();  // e.g. an interleaved non-Ping message or reconnect
+    EXPECT_FALSE(assembler.buffering());
+
+    // A fresh sequence assembles from scratch.
+    EXPECT_FALSE(assembler.feed(chunks[0]).has_value());
+    EXPECT_TRUE(assembler.feed(chunks[1]).has_value());
 }
 
 // ---------------------------------------------------------- session ids

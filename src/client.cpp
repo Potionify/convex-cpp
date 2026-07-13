@@ -85,6 +85,7 @@ struct client_impl : std::enable_shared_from_this<client_impl> {
     // ------------------------------------------------------------------
     mutable std::mutex mu;
     base_client base;
+    transition_chunk_assembler chunk_assembler;  // per-connection, cleared on disconnect
     std::unique_ptr<websocket_connection> conn;
     std::unique_ptr<slot> conn_slot;
     std::uint64_t conn_gen = 0;
@@ -171,6 +172,7 @@ struct client_impl : std::enable_shared_from_this<client_impl> {
     // next attempt.
     void begin_disconnect(dispatch_list& out, std::string reason) {
         ++conn_gen;
+        chunk_assembler.abandon();
         if (conn || conn_slot) {
             garbage.emplace_back(std::move(conn), std::move(conn_slot));
         }
@@ -245,6 +247,25 @@ struct client_impl : std::enable_shared_from_this<client_impl> {
                 begin_disconnect(out, std::string("ProtocolError: ") + e.what());
                 deliver_later(std::move(out));
                 return;
+            }
+
+            // Split Transitions are reassembled here; the state machine only
+            // ever sees whole messages. A non-chunk message (other than Ping,
+            // which the server's keepalive timer may interleave mid-split)
+            // invalidates any partial buffer, mirroring convex-js.
+            if (const auto* chunk = std::get_if<transition_chunk_message>(&msg)) {
+                std::optional<transition_message> assembled;
+                try {
+                    assembled = chunk_assembler.feed(*chunk);
+                } catch (const protocol_error& e) {
+                    begin_disconnect(out, std::string("ProtocolError: ") + e.what());
+                    deliver_later(std::move(out));
+                    return;
+                }
+                if (!assembled) return;  // more parts coming
+                msg = std::move(*assembled);
+            } else if (!std::holds_alternative<ping_message>(msg)) {
+                chunk_assembler.abandon();
             }
 
             auto r = base.receive_message(msg);

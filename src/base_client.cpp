@@ -263,6 +263,13 @@ base_client::receive_result base_client::receive_message(const server_message& m
         return out;
     }
 
+    if (std::get_if<transition_chunk_message>(&message) != nullptr) {
+        // Chunks belong to the transport layer (transition_chunk_assembler);
+        // one reaching the state machine means the caller skipped assembly.
+        out.reconnect_reason = "ProtocolError: unassembled TransitionChunk";
+        return out;
+    }
+
     // ping_message: server traffic already proves liveness; nothing to do.
     return out;
 }
