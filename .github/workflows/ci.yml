@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Unit tests: sans-IO core + mock transport, no networking needed.
+  unit:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        # CMAKE_BUILD_TYPE applies to single-config (Linux); --config to
+        # multi-config (MSVC). Passing both is harmless on either.
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # Full stack against a real self-hosted backend: IXWebSocket transport
+  # (MbedTLS from source), the integration schema deployed via the Convex
+  # CLI, and the live test suite (the cloud TLS test self-skips — no cloud
+  # credentials in CI).
+  integration:
+    name: Live integration tests (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Convex backend
+        run: docker compose -f integration/backend/docker-compose.yml up -d --wait backend
+
+      - name: Generate admin key
+        run: |
+          KEY=$(docker compose -f integration/backend/docker-compose.yml exec -T backend ./generate_admin_key.sh | tail -n 1)
+          echo "::add-mask::$KEY"
+          echo "CONVEX_LOCAL_ADMIN_KEY=$KEY" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deploy the test project
+        working-directory: integration/convex-test-project
+        env:
+          CONVEX_SELF_HOSTED_URL: http://127.0.0.1:3210
+          CONVEX_SELF_HOSTED_ADMIN_KEY: ${{ env.CONVEX_LOCAL_ADMIN_KEY }}
+        run: |
+          npm ci
+          npx convex deploy -y
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCONVEX_WITH_IXWEBSOCKET=ON
+          -DCONVEX_BUILD_INTEGRATION_TESTS=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run integration tests
+        env:
+          CONVEX_LOCAL_URL: http://127.0.0.1:3210
+        run: ./build/integration/tests/convex_integration_tests --gtest_color=yes
+
+      - name: Backend logs on failure
+        if: failure()
+        run: docker compose -f integration/backend/docker-compose.yml logs backend | tail -100
