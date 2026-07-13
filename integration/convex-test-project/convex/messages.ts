@@ -1,4 +1,5 @@
 import { query, mutation } from "./_generated/server";
+import { paginationOptsValidator } from "convex/server";
 import { v } from "convex/values";
 
 // List messages in a channel, oldest first (ascending _creationTime).
@@ -10,6 +11,19 @@ export const list = query({
       .withIndex("by_channel", (q) => q.eq("channel", channel))
       .order("asc")
       .collect();
+  },
+});
+
+// Paginated list of messages in a channel, oldest first. Exercised by the
+// convex::paginated_query live tests.
+export const listPaginated = query({
+  args: { channel: v.string(), paginationOpts: paginationOptsValidator },
+  handler: async (ctx, { channel, paginationOpts }) => {
+    return await ctx.db
+      .query("messages")
+      .withIndex("by_channel", (q) => q.eq("channel", channel))
+      .order("asc")
+      .paginate(paginationOpts);
   },
 });
 

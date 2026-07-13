@@ -141,6 +141,8 @@ curl -X POST https://disciplined-cow-12.convex.cloud/api/query \
 ## Functions reference (for the C++ tests)
 
 - `messages:list` (query) — args `{channel}`, returns messages oldest-first.
+- `messages:listPaginated` (query) — args `{channel, paginationOpts}`, returns
+  a `PaginationResult` page of messages oldest-first (for `paginated_query`).
 - `messages:send` (mutation) — args `{channel, author, body}`, returns the new id.
 - `messages:clearAll` (mutation) — no args, deletes all, returns count removed.
 - `counters:get` (query) — args `{name}`, returns `number | null`.

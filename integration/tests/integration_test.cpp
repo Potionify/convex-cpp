@@ -20,6 +20,7 @@
 #include <convex/file_storage.h>
 #include <convex/http_client.h>
 #include <convex/json_codec.h>
+#include <convex/paginated.h>
 #include <gtest/gtest.h>
 
 #include "ixwebsocket/ixwebsocket_transport.h"
@@ -205,6 +206,67 @@ TEST(Live, MessagesListOrdered) {
     // System fields come through as real values.
     EXPECT_TRUE(messages[0].as_object().at("_creationTime").is_float64());
     EXPECT_TRUE(messages[0].as_object().at("_id").is_string());
+}
+
+TEST(Live, PaginatedQueryChainsPagesAndSeesLiveInserts) {
+    auto c = make_client(local_url());
+    const std::string channel = unique_name("paged");
+
+    auto send = [&](const std::string& body) {
+        auto m = c.mutation("messages:send", {{"channel", value(channel)},
+                                              {"author", value("cpp")},
+                                              {"body", value(body)}});
+        ASSERT_TRUE(await(m).ok());
+    };
+    for (int i = 1; i <= 5; ++i) send("m" + std::to_string(i));
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<paginated_snapshot> snaps;
+    paginated_query pq(
+        c, {"messages:listPaginated", {{"channel", value(channel)}}, /*initial_num_items=*/2},
+        [&](const paginated_snapshot& s) {
+            std::lock_guard lk(mu);
+            snaps.push_back(s);
+            cv.notify_all();
+        });
+    auto wait_snap = [&](auto pred) {
+        std::unique_lock lk(mu);
+        return cv.wait_for(lk, 15s, [&] { return !snaps.empty() && pred(snaps.back()); });
+    };
+    auto bodies = [](const paginated_snapshot& s) {
+        std::vector<std::string> out;
+        for (const value& doc : s.results) out.push_back(doc.as_object().at("body").as_string());
+        return out;
+    };
+
+    // First page: 2 of 5, more available.
+    ASSERT_TRUE(wait_snap([](const paginated_snapshot& s) {
+        return s.status == pagination_status::can_load_more && s.results.size() == 2;
+    }));
+    EXPECT_EQ(bodies(pq.snapshot()), (std::vector<std::string>{"m1", "m2"}));
+
+    // Second page chains at the real server cursor.
+    ASSERT_TRUE(pq.load_more(2));
+    ASSERT_TRUE(wait_snap([](const paginated_snapshot& s) {
+        return s.status == pagination_status::can_load_more && s.results.size() == 4;
+    }));
+
+    // Third page drains the list.
+    ASSERT_TRUE(pq.load_more(10));
+    ASSERT_TRUE(wait_snap(
+        [](const paginated_snapshot& s) { return s.status == pagination_status::exhausted; }));
+    EXPECT_EQ(bodies(pq.snapshot()),
+              (std::vector<std::string>{"m1", "m2", "m3", "m4", "m5"}));
+
+    // Live update: a new message lands in the (unbounded) last page without
+    // disturbing earlier page boundaries.
+    send("m6");
+    ASSERT_TRUE(wait_snap([](const paginated_snapshot& s) { return s.results.size() == 6; }));
+    const auto final_snap = pq.snapshot();
+    EXPECT_EQ(final_snap.status, pagination_status::exhausted);
+    EXPECT_EQ(bodies(final_snap),
+              (std::vector<std::string>{"m1", "m2", "m3", "m4", "m5", "m6"}));
 }
 
 TEST(Live, ConvexErrorCarriesData) {
