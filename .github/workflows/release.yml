@@ -1,9 +1,9 @@
 name: Release
 
 # Cutting a release:
-#   1. Bump the macros in include/convex/version.h (the single source of
-#      truth — CMake's project(VERSION) and the client_id derive from it).
-#   2. Commit, then tag: git tag vX.Y.Z && git push origin main --tags
+#   1. cmake -DBUMP=patch -P scripts/bump_version.cmake   (or minor/major/x.y.z)
+#      — bumps include/convex/version.h, commits, and creates the tag.
+#   2. git push origin main --tags
 # This workflow runs the full CI suite against the tag, checks the tag matches
 # the CMake version, and publishes a GitHub Release with generated notes.
 # No binary artifacts: consumers use FetchContent/CPM against the tag, and

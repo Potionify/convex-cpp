@@ -6,6 +6,8 @@
 #   cmake -DBUMP=major -P scripts/bump_version.cmake    # 0.1.0 -> 1.0.0
 #   cmake -DBUMP=1.2.3 -P scripts/bump_version.cmake    # explicit version
 #
+# PowerShell splits unquoted dotted args — quote them: cmake "-DBUMP=1.2.3" ...
+#
 # Then publish (this triggers the release workflow):
 #
 #   git push origin main --tags
