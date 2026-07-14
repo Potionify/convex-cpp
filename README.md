@@ -145,6 +145,17 @@ tests/             unit tests: codec conformance, protocol shapes,
 integration/       dockerized convex-backend, test schema, live tests
 ```
 
+## Backend compatibility
+
+The client targets the Convex wire protocol, not a specific backend version.
+Works against Convex cloud (continuously deployed — the protocol stays
+backward compatible with released clients, the same contract convex-js and
+convex-rs rely on) and the self-hosted open-source backend. Each connection
+identifies itself with a `Convex-Client: cpp-<version>` header, giving the
+server a hook to reject a client whose protocol level is too old. The live
+integration suite runs against `convex-backend:latest`, so protocol drift
+surfaces in CI rather than in applications.
+
 ## Protocol notes
 
 The sync protocol implementation follows convex-rs's `BaseConvexClient`
