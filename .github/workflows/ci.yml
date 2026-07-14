@@ -15,7 +15,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         # CMAKE_BUILD_TYPE applies to single-config (Linux); --config to
@@ -36,7 +36,7 @@ jobs:
     name: Live integration tests (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Start Convex backend
         run: docker compose -f integration/backend/docker-compose.yml up -d --wait backend
@@ -47,7 +47,7 @@ jobs:
           echo "::add-mask::$KEY"
           echo "CONVEX_LOCAL_ADMIN_KEY=$KEY" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
 
