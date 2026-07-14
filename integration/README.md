@@ -104,9 +104,9 @@ curl -X POST http://127.0.0.1:3210/api/query \
 
 ## Deploy the test project to the CLOUD dev deployment
 
-Cloud credentials live in `../../../convex.env.local`
-(`F:\GitHub-Potionify\potionify-workspace\convex.env.local`): `CONVEX_DEPLOY_KEY`
-(a `dev:` deploy key) and `CONVEX_URL`.
+Cloud credentials live in `../../../convex.env.local` (one directory above the
+repo checkout, outside the repo): `CONVEX_DEPLOY_KEY` (a `dev:` deploy key) and
+`CONVEX_URL`.
 
 Because it is a **dev** deploy key, use `convex dev --once` (a one-shot push to
 the dev deployment). `convex deploy` targets production and is not used here.
@@ -121,7 +121,7 @@ npx convex dev --once
 Verify against the cloud URL (expects `{"status":"success","value":null}`):
 
 ```bash
-curl -X POST https://disciplined-cow-12.convex.cloud/api/query \
+curl -X POST https://<your-deployment>.convex.cloud/api/query \
   -H "Content-Type: application/json" \
   -H "Authorization: Convex <CONVEX_DEPLOY_KEY from convex.env.local>" \
   -d '{"path":"counters:get","args":[{"name":"smoke"}],"format":"convex_encoded_json"}'
@@ -136,7 +136,7 @@ curl -X POST https://disciplined-cow-12.convex.cloud/api/query \
 |--------------------------------------------------|------------------------------------------------------|--------|
 | `integration/local.env`                          | `CONVEX_LOCAL_URL`, `CONVEX_LOCAL_ADMIN_KEY`         | yes    |
 | `integration/convex-test-project/.env.local`     | cloud `CONVEX_DEPLOYMENT` / `CONVEX_URL` (auto-written by `convex dev`) | yes |
-| `potionify-workspace/convex.env.local`           | cloud `CONVEX_DEPLOY_KEY`, `CONVEX_URL`              | yes    |
+| `../convex.env.local` (above the repo checkout)  | cloud `CONVEX_DEPLOY_KEY`, `CONVEX_URL`              | yes    |
 
 ## Functions reference (for the C++ tests)
 
