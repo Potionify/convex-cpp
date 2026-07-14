@@ -2,7 +2,9 @@ name: Release
 
 # Cutting a release:
 #   1. Bump VERSION in CMakeLists.txt `project(convex VERSION x.y.z ...)`.
-#   2. Commit, then tag: git tag vX.Y.Z && git push origin main --tags
+#   2. Bump the default client_id ("cpp-x.y.z") in include/convex/client.h —
+#      it is the version the backend sees, and the check below can't see it.
+#   3. Commit, then tag: git tag vX.Y.Z && git push origin main --tags
 # This workflow runs the full CI suite against the tag, checks the tag matches
 # the CMake version, and publishes a GitHub Release with generated notes.
 # No binary artifacts: consumers use FetchContent/CPM against the tag, and
