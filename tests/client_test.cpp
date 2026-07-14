@@ -99,7 +99,7 @@ TEST(Client, ConnectHandshakeAndHeaders) {
     EXPECT_EQ(transport->url(0), "wss://unit-test.convex.cloud/api/sync");
     const auto headers = transport->headers(0);
     ASSERT_TRUE(headers.contains("Convex-Client"));
-    EXPECT_EQ(headers.at("Convex-Client"), "cpp-0.1.0");
+    EXPECT_EQ(headers.at("Convex-Client"), "cpp-" CONVEX_VERSION);
 }
 
 TEST(Client, SubscribeDeliversUpdatesThroughPump) {

@@ -1,5 +1,17 @@
 cmake_minimum_required(VERSION 3.21)
-project(convex VERSION 0.1.0 LANGUAGES CXX)
+
+# The version is defined once, in include/convex/version.h.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/convex/version.h" _convex_version_h)
+foreach(part MAJOR MINOR PATCH)
+    if(NOT _convex_version_h MATCHES "#define CONVEX_VERSION_${part} ([0-9]+)")
+        message(FATAL_ERROR "CONVEX_VERSION_${part} not found in include/convex/version.h")
+    endif()
+    set(_convex_version_${part} "${CMAKE_MATCH_1}")
+endforeach()
+
+project(convex
+    VERSION ${_convex_version_MAJOR}.${_convex_version_MINOR}.${_convex_version_PATCH}
+    LANGUAGES CXX)
 
 if(PROJECT_IS_TOP_LEVEL)
     set(CONVEX_DEV_DEFAULT ON)

@@ -1,10 +1,9 @@
 name: Release
 
 # Cutting a release:
-#   1. Bump VERSION in CMakeLists.txt `project(convex VERSION x.y.z ...)`.
-#   2. Bump the default client_id ("cpp-x.y.z") in include/convex/client.h —
-#      it is the version the backend sees, and the check below can't see it.
-#   3. Commit, then tag: git tag vX.Y.Z && git push origin main --tags
+#   1. Bump the macros in include/convex/version.h (the single source of
+#      truth — CMake's project(VERSION) and the client_id derive from it).
+#   2. Commit, then tag: git tag vX.Y.Z && git push origin main --tags
 # This workflow runs the full CI suite against the tag, checks the tag matches
 # the CMake version, and publishes a GitHub Release with generated notes.
 # No binary artifacts: consumers use FetchContent/CPM against the tag, and
@@ -30,12 +29,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Verify tag matches CMake project version
+      - name: Verify tag matches version.h
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          cmake_version=$(sed -nE 's/^project\(convex VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)
-          if [ "$tag" != "$cmake_version" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match CMakeLists.txt version $cmake_version" >&2
+          get() { sed -nE "s/#define CONVEX_VERSION_$1 ([0-9]+)/\1/p" include/convex/version.h; }
+          header_version="$(get MAJOR).$(get MINOR).$(get PATCH)"
+          if [ "$tag" != "$header_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match version.h ($header_version)" >&2
             exit 1
           fi
 

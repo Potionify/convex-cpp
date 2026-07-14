@@ -16,6 +16,7 @@
 #include <convex/protocol.h>
 #include <convex/transport.h>
 #include <convex/value.h>
+#include <convex/version.h>
 
 #include <chrono>
 #include <functional>
@@ -63,7 +64,7 @@ struct client_options {
     delivery delivery_mode = delivery::pumped;
 
     /// Reported to the server in the Convex-Client header.
-    std::string client_id = "cpp-0.1.0";
+    std::string client_id = "cpp-" CONVEX_VERSION;
 
     std::chrono::milliseconds initial_backoff{100};
     std::chrono::milliseconds max_backoff{15000};

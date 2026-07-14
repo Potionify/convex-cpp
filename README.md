@@ -137,7 +137,7 @@ deployment, admin key generation).
 
 ```
 include/convex/    public headers (value, protocol, base_client, client,
-                   http_client, file_storage, transport)
+                   http_client, file_storage, transport, version)
 src/               implementation (+ src/detail: base64, nlohmann bridge)
 transports/        bundled IXWebSocket transport (optional)
 tests/             unit tests: codec conformance, protocol shapes,
