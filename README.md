@@ -44,6 +44,24 @@ The core library target `convex::convex` has **no dependencies beyond the
 vendored [nlohmann/json](third_party/nlohmann/json.hpp)** (a private,
 implementation-only dependency — no public header includes it).
 
+### Using in your project (FetchContent)
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+    convex
+    GIT_REPOSITORY https://github.com/Potionify/convex-cpp.git
+    GIT_TAG v0.1.0
+)
+set(CONVEX_WITH_IXWEBSOCKET ON)  # bundled desktop transport; omit if you supply your own
+FetchContent_MakeAvailable(convex)
+
+target_link_libraries(my_app PRIVATE convex::convex convex::ixwebsocket)
+```
+
+Link only `convex::convex` (and skip the `set`) if you bring your own
+transport — the core has no networking dependencies.
+
 ## Quick start
 
 ```cpp
