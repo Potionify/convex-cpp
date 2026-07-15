@@ -7,6 +7,8 @@
 #   cmake -DBUMP=1.2.3 -P scripts/bump_version.cmake    # explicit version
 #
 # PowerShell splits unquoted dotted args — quote them: cmake "-DBUMP=1.2.3" ...
+# Or use the wrappers (no quoting needed): scripts/bump_version.bat patch
+# on Windows, scripts/bump_version.sh patch on Linux/macOS.
 #
 # Then publish (this triggers the release workflow):
 #
