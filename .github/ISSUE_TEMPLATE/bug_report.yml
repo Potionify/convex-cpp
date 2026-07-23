@@ -1,0 +1,40 @@
+name: Bug report
+description: Something isn't working as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead? A minimal code snippet helps a lot.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: convex-cpp version
+      placeholder: e.g. v0.1.1, or a commit hash
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and compiler
+      placeholder: e.g. Windows 11 / MSVC 2022, Ubuntu 24.04 / gcc 13
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - Convex cloud
+        - Self-hosted backend
+        - Not applicable
+    validations:
+      required: true
+  - type: input
+    id: transport
+    attributes:
+      label: Transport
+      placeholder: e.g. bundled IXWebSocket, custom (convex-ue), HTTP client

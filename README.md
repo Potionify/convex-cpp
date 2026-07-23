@@ -1,28 +1,36 @@
 # convex-cpp
 
-A C++20 client for [Convex](https://convex.dev), ported from the official
-[convex-rs](https://github.com/get-convex/convex-rs) client with wire-protocol
-details cross-checked against [convex-js](https://github.com/get-convex/convex-js).
+[![CI](https://github.com/Potionify/convex-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/Potionify/convex-cpp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Potionify/convex-cpp)](https://github.com/Potionify/convex-cpp/releases)
+[![License](https://img.shields.io/github/license/Potionify/convex-cpp)](LICENSE)
 
-- **Realtime sync client** (`convex::client`): WebSocket sync protocol with
-  live query subscriptions, ordered mutations (read-your-writes), actions,
-  authentication, and automatic reconnection with jittered backoff.
-- **Pagination helper** (`convex::paginated_query`): a growing, live-updating
-  list over a paginated query — the convex-js `usePaginatedQuery` state
-  machine (one live subscription per page, `load_more`, seam-free page
-  boundaries via query journals, resets on argument changes and stale
-  cursors).
-- **HTTP client** (`convex::http_client`): one-shot queries/mutations/actions
-  over plain HTTP, plus file storage upload/download helpers.
-- **Sans-IO core**: the protocol state machine (`convex::base_client`) does no
-  networking. Transports plug in behind two small interfaces, so the library
-  runs anywhere — a bundled [IXWebSocket](https://github.com/machinezone/IXWebSocket)
-  transport serves desktop apps, and game engines supply their own (see
-  [convex-ue](https://github.com/Potionify/convex-ue) for Unreal Engine).
-- **Full Convex value fidelity**: Int64 (`$integer`), Bytes (`$bytes`),
-  special floats (`$float` for NaN/±Infinity/-0.0), unicode strings, nested
-  arrays/objects — byte-exact against the real backend, covered by
-  conformance and live integration tests.
+A community C++20 client for [Convex](https://convex.dev), ported from the
+official [convex-rs](https://github.com/get-convex/convex-rs) client with
+wire-protocol details cross-checked against
+[convex-js](https://github.com/get-convex/convex-js). Not an official
+Convex product.
+
+The realtime sync client (`convex::client`) speaks the WebSocket sync
+protocol: live query subscriptions, ordered mutations with read-your-writes,
+actions, authentication, and automatic reconnection with jittered backoff.
+On top of it, `convex::paginated_query` implements the convex-js
+`usePaginatedQuery` state machine as a growing, live-updating list over a
+paginated query. It keeps one live subscription per page, exposes
+`load_more`, avoids seams at page boundaries via query journals, and resets
+on argument changes or stale cursors. For one-shot calls without a
+WebSocket there is `convex::http_client`, plus file storage
+upload/download helpers.
+
+The protocol core is sans-IO: `convex::base_client` does no networking at
+all. Transports plug in behind two small interfaces, so the library runs
+anywhere. A bundled [IXWebSocket](https://github.com/machinezone/IXWebSocket)
+transport serves desktop apps, and game engines supply their own (see
+[convex-ue](https://github.com/Potionify/convex-ue) for Unreal Engine).
+
+Values keep full Convex fidelity. Int64 (`$integer`), Bytes (`$bytes`),
+special floats (`$float` for NaN/±Infinity/-0.0), unicode strings, and
+nested arrays and objects all round-trip byte-exact against the real
+backend. Conformance tests and live integration tests cover all of it.
 
 ## Building
 
@@ -41,8 +49,8 @@ cmake --build build --config Release
 | `CONVEX_BUILD_INTEGRATION_TESTS` | OFF | Live tests (need a running backend, see below) |
 
 The core library target `convex::convex` has **no dependencies beyond the
-vendored [nlohmann/json](third_party/nlohmann/json.hpp)** (a private,
-implementation-only dependency — no public header includes it).
+vendored [nlohmann/json](third_party/nlohmann/json.hpp)**, and no public
+header exposes it.
 
 ### Using in your project (FetchContent)
 
@@ -60,7 +68,7 @@ target_link_libraries(my_app PRIVATE convex::convex convex::ixwebsocket)
 ```
 
 Link only `convex::convex` (and skip the `set`) if you bring your own
-transport — the core has no networking dependencies.
+transport. The core has no networking dependencies.
 
 ## Quick start
 
@@ -96,18 +104,19 @@ while (running) {
 
 Key types:
 
-- `convex::value` — null / boolean / **int64** / float64 / string / **bytes** /
-  array / object. `convex::value(42)` is an Int64; `convex::value(42.0)` a
-  Float64 — Convex treats these as distinct types.
-- `convex::function_result` — success value, plain error message, or a
-  `convex_error` with the structured data payload of a thrown `ConvexError`.
-- `client_options::delivery_mode` — `pumped` (callbacks fire inside
-  `process_events()`, ideal for frame loops) or `immediate` (callbacks fire on
-  internal threads).
+- `convex::value` holds null, boolean, int64, float64, string, bytes,
+  array, or object. Convex treats Int64 and Float64 as distinct types:
+  `convex::value(42)` is an Int64, `convex::value(42.0)` a Float64.
+- `convex::function_result` is a success value, a plain error message, or a
+  `convex_error` carrying the structured data payload of a thrown
+  `ConvexError`.
+- `client_options::delivery_mode` selects `pumped` (callbacks fire inside
+  `process_events()`, ideal for frame loops) or `immediate` (callbacks fire
+  on internal threads).
 
-Auth: `client.set_auth(convex::auth_token::user(jwt), fetcher)` — the optional
-fetcher is invoked with `force_refresh=true` on every reconnect so expired
-tokens are replaced. Admin: `convex::auth_token::admin(deploy_key)`.
+Auth: `client.set_auth(convex::auth_token::user(jwt), fetcher)`. The
+optional fetcher is invoked with `force_refresh=true` on every reconnect so
+expired tokens are replaced. Admin: `convex::auth_token::admin(deploy_key)`.
 
 ### HTTP one-shot + file storage
 
@@ -129,9 +138,9 @@ Implement `convex::websocket_transport` (plus `websocket_connection` /
 [`include/convex/transport.h`](include/convex/transport.h) and pass them in
 the options. Rules of the contract:
 
-- The client owns reconnect policy — transports must not auto-reconnect.
-- `on_close` is terminal per connection; destroying a connection object must
-  guarantee no further callbacks.
+- The client owns reconnect policy. Transports must not auto-reconnect.
+- `on_close` is terminal per connection. Destroying a connection object
+  must guarantee no further callbacks.
 
 ## Testing
 
@@ -165,14 +174,15 @@ integration/       dockerized convex-backend, test schema, live tests
 
 ## Backend compatibility
 
-The client targets the Convex wire protocol, not a specific backend version.
-Works against Convex cloud (continuously deployed — the protocol stays
-backward compatible with released clients, the same contract convex-js and
-convex-rs rely on) and the self-hosted open-source backend. Each connection
-identifies itself with a `Convex-Client: cpp-<version>` header, giving the
-server a hook to reject a client whose protocol level is too old. The live
-integration suite runs against `convex-backend:latest`, so protocol drift
-surfaces in CI rather than in applications.
+The client targets the Convex wire protocol, not a specific backend
+version. It works against Convex cloud and against the self-hosted
+open-source backend. Cloud is continuously deployed, and the protocol
+stays backward compatible with released clients, the same contract
+convex-js and convex-rs rely on. Each connection identifies itself with a
+`Convex-Client: cpp-<version>` header. That gives the server a hook to
+reject a client whose protocol level is too old. The live integration
+suite runs against `convex-backend:latest`, so protocol drift shows up in
+CI first.
 
 ## Protocol notes
 
@@ -180,15 +190,17 @@ The sync protocol implementation follows convex-rs's `BaseConvexClient`
 (`base_client` here is its direct port) with wire shapes from convex-js
 `src/browser/sync/protocol.ts`. Invariants worth knowing:
 
-- Mutation results are held until a `Transition` advances past the mutation's
-  timestamp, so completed mutations are always visible in query results.
-- In-flight mutations are resent on reconnect (deduplicated server-side by
-  session + request id); in-flight **actions fail** instead — they are not
-  idempotent. Never-sent actions are resent.
-- Query identity is the canonicalized `path + args` JSON with sorted object
-  keys; identical subscriptions share one server query.
-- Timestamps are opaque 64-bit tokens (base64, little-endian) — never doubles.
+- Mutation results are held until a `Transition` advances past the
+  mutation's timestamp, so completed mutations are always visible in query
+  results.
+- In-flight mutations are resent on reconnect, deduplicated server-side by
+  session and request id. In-flight **actions fail** instead, because they
+  are not idempotent. Actions that were never sent are resent.
+- Query identity is the canonicalized `path + args` JSON with sorted
+  object keys. Identical subscriptions share one server query.
+- Timestamps are opaque 64-bit tokens (base64, little-endian), never
+  doubles.
 
 ## License
 
-Apache-2.0. Not an official Convex product.
+Apache-2.0.

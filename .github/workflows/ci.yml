@@ -7,6 +7,9 @@ on:
   # Lets release.yml run the full suite as its pre-publish gate.
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
   # Unit tests: sans-IO core + mock transport, no networking needed.
   unit:

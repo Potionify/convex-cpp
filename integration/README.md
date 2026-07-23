@@ -1,13 +1,11 @@
-# Convex C++ Client — Integration Test Environment
+# Convex C++ Client: Integration Test Environment
 
-This directory hosts a self-contained Convex environment used by the C++ Convex
-client integration tests. It provides:
-
-- A **local self-hosted** open-source Convex backend running in Docker.
-- A minimal **Convex TypeScript project** (`convex-test-project/`) whose schema
-  and functions exercise the full Convex value space.
-- The project deployed to **both** the local backend and the shared **cloud dev**
-  deployment, so tests can run against either target.
+The integration tests run against a real backend, and this directory holds
+everything they need: a self-hosted open-source Convex backend running in
+Docker, and a minimal Convex TypeScript project (`convex-test-project/`)
+whose schema and functions exercise the full Convex value space. The local
+backend is what CI uses, and it is all you need. Running against a cloud
+dev deployment is optional (see below).
 
 ```
 integration/
@@ -69,9 +67,8 @@ docker compose exec backend ./generate_admin_key.sh
 The generated key is stored in `../local.env` as `CONVEX_LOCAL_ADMIN_KEY`.
 Regenerate it any time (e.g. after `docker compose down -v`) and update that file.
 
-> The admin key grants full admin access to the LOCAL backend only. It is a
-> secret — do not commit `local.env`. (`.gitignore` handling is managed
-> separately.)
+> The admin key grants full admin access to the LOCAL backend only. It is
+> still a secret. `local.env` is gitignored, and it needs to stay that way.
 
 ## Deploy the test project to the LOCAL backend
 
@@ -102,19 +99,22 @@ curl -X POST http://127.0.0.1:3210/api/query \
   -d '{"path":"counters:get","args":[{"name":"smoke"}],"format":"convex_encoded_json"}'
 ```
 
-## Deploy the test project to the CLOUD dev deployment
+## Deploy the test project to a CLOUD dev deployment (optional)
 
-Cloud credentials live in `../../../convex.env.local` (one directory above the
-repo checkout, outside the repo): `CONVEX_DEPLOY_KEY` (a `dev:` deploy key) and
-`CONVEX_URL`.
+The suite can also run against a Convex cloud dev deployment. That path
+exercises real TLS, which the local flow does not. You need your own
+deployment and a `dev:` deploy key from the dashboard, kept in an env file
+outside the repo. Contributors can skip this whole section: the cloud TLS
+test self-skips when no credentials are present, and CI only uses the
+local backend.
 
-Because it is a **dev** deploy key, use `convex dev --once` (a one-shot push to
+Because it is a dev deploy key, use `convex dev --once` (a one-shot push to
 the dev deployment). `convex deploy` targets production and is not used here.
-Make sure the self-hosted env vars from the local flow are **not** set.
+Make sure the self-hosted env vars from the local flow are not set.
 
 ```bash
-# from convex-test-project/, with CONVEX_DEPLOY_KEY exported from convex.env.local:
-export CONVEX_DEPLOY_KEY="<from convex.env.local>"
+# from convex-test-project/:
+export CONVEX_DEPLOY_KEY="<your dev: deploy key>"
 npx convex dev --once
 ```
 
@@ -123,12 +123,12 @@ Verify against the cloud URL (expects `{"status":"success","value":null}`):
 ```bash
 curl -X POST https://<your-deployment>.convex.cloud/api/query \
   -H "Content-Type: application/json" \
-  -H "Authorization: Convex <CONVEX_DEPLOY_KEY from convex.env.local>" \
+  -H "Authorization: Convex <your dev: deploy key>" \
   -d '{"path":"counters:get","args":[{"name":"smoke"}],"format":"convex_encoded_json"}'
 ```
 
-> Never paste the deploy key into source or logs — always reference it from the
-> env file.
+> Never paste the deploy key into source or logs. Always reference it from an
+> env file kept outside the repo.
 
 ## Env files at a glance
 
@@ -136,23 +136,23 @@ curl -X POST https://<your-deployment>.convex.cloud/api/query \
 |--------------------------------------------------|------------------------------------------------------|--------|
 | `integration/local.env`                          | `CONVEX_LOCAL_URL`, `CONVEX_LOCAL_ADMIN_KEY`         | yes    |
 | `integration/convex-test-project/.env.local`     | cloud `CONVEX_DEPLOYMENT` / `CONVEX_URL` (auto-written by `convex dev`) | yes |
-| `../convex.env.local` (above the repo checkout)  | cloud `CONVEX_DEPLOY_KEY`, `CONVEX_URL`              | yes    |
+| your own env file, outside the repo              | cloud `CONVEX_DEPLOY_KEY`, `CONVEX_URL` (optional)   | yes    |
 
 ## Functions reference (for the C++ tests)
 
-- `messages:list` (query) — args `{channel}`, returns messages oldest-first.
-- `messages:listPaginated` (query) — args `{channel, paginationOpts}`, returns
+- `messages:list` (query): args `{channel}`, returns messages oldest-first.
+- `messages:listPaginated` (query): args `{channel, paginationOpts}`, returns
   a `PaginationResult` page of messages oldest-first (for `paginated_query`).
-- `messages:send` (mutation) — args `{channel, author, body}`, returns the new id.
-- `messages:clearAll` (mutation) — no args, deletes all, returns count removed.
-- `counters:get` (query) — args `{name}`, returns `number | null`.
-- `counters:increment` (mutation) — args `{name, by?}`, creates/increments, returns new value.
-- `values:echoQuery` / `values:echoMutation` — args `{x}` (`v.any()`), returns `x`.
-- `values:kitchenSink` (query) — no args, returns an object with every Convex
+- `messages:send` (mutation): args `{channel, author, body}`, returns the new id.
+- `messages:clearAll` (mutation): no args, deletes all, returns count removed.
+- `counters:get` (query): args `{name}`, returns `number | null`.
+- `counters:increment` (mutation): args `{name, by?}`, creates/increments, returns new value.
+- `values:echoQuery` / `values:echoMutation`: args `{x}` (`v.any()`), returns `x`.
+- `values:kitchenSink` (query): no args, returns an object with every Convex
   value type: null, booleans, Int64 (`9007199254740993n`, `-9223372036854775808n`),
   floats (incl. `NaN`, `±Infinity`, `-0` in an array), a unicode string, bytes
   (`ArrayBuffer` of `0..7`), a nested array, and a nested object.
-- `errors:throwConvexError` (query) — throws `ConvexError({code:"TEST", details:[1,"two"]})`.
-- `errors:throwPlainError` (query) — throws `Error("plain failure")`.
-- `actions:echoAction` (action) — args `{x}`, returns `x`.
-- `actions:now` (action) — no args, returns `Date.now()`.
+- `errors:throwConvexError` (query): throws `ConvexError({code:"TEST", details:[1,"two"]})`.
+- `errors:throwPlainError` (query): throws `Error("plain failure")`.
+- `actions:echoAction` (action): args `{x}`, returns `x`.
+- `actions:now` (action): no args, returns `Date.now()`.
