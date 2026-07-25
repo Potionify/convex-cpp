@@ -549,6 +549,45 @@ TEST(Paginated, IncompletePageWithNoSplitPointWaitsInsteadOfResetting) {
     EXPECT_EQ(h.pq.snapshot().results, items({"a", "b"}));
 }
 
+TEST(Paginated, SplitIsAbandonedAsSoonAsAHalfFails) {
+    // The peer may never arrive. Waiting for it before dropping a split that
+    // cannot complete leaves the page it was repairing blocked, because
+    // consider_split skips a page while a split of it is pending.
+    harness h;
+    h.transport->server_send(
+        0, transition_page({0, TS0}, {1, TS1}, 0,
+                           page_value({"a", "b", "c", "d"}, false, "c1", "SplitRequired", "s1"),
+                           "j0"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(2).empty(); }));
+    EXPECT_TRUE(h.pq.snapshot().results.empty()) << "incomplete page stays hidden";
+
+    // One half fails; the other never returns.
+    h.transport->server_send(
+        0, transition_failed({1, TS1}, {2, TS2}, 1, "Server Error: Uncaught Error: boom"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return h.sent_remove(1) && h.sent_remove(2); }))
+        << "both halves drop without waiting for the peer";
+    EXPECT_EQ(h.pq.snapshot().status, pagination_status::loading_first_page);
+    EXPECT_FALSE(h.sent_remove(0)) << "the page itself stays subscribed";
+
+    // The page is no longer blocked: its next update starts a fresh split.
+    h.transport->server_send(
+        0, transition_page({2, TS2}, {3, TS3}, 0,
+                           page_value({"a", "b", "c", "d"}, false, "c1", "SplitRequired", "s1"),
+                           "j0b"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(4).empty(); }))
+        << "a dead split must not block the retry";
+    EXPECT_EQ(h.opts_for(3)["endCursor"], "s1");
+    EXPECT_EQ(h.opts_for(4)["cursor"], "s1");
+
+    // And that one completes.
+    h.transport->server_send(
+        0, transition_page({3, TS3}, {4, TS4}, 3, page_value({"a", "b"}, false, "s1"), "k0"));
+    h.transport->server_send(
+        0, transition_page({4, TS4}, {5, TS4}, 4, page_value({"c", "d"}, true, "c1"), "k1"));
+    ASSERT_TRUE(h.wait_status(pagination_status::exhausted));
+    EXPECT_EQ(h.pq.snapshot().results, items({"a", "b", "c", "d"}));
+}
+
 TEST(Paginated, FailedSplitLeavesThePageAndRetriesOnTheNextUpdate) {
     // A half failing is not fatal: drop the split, keep the page, and try
     // again when the server next sends that page. One attempt per transition,

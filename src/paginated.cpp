@@ -253,16 +253,21 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
     void advance_split(std::size_t index) {
         {
             pending_split& s = splits[index];
-            if (!s.first.result || !s.second.result) return;
-            if (!s.first.result->ok() || !s.second.result->ok()) {
-                // A half failed for a reason other than InvalidCursor (that
-                // resets before we get here). Drop the split and leave the
-                // page it was repairing in place. The next update of that page
-                // tries again — one attempt per server transition, not a loop
-                // we drive ourselves.
+            // Look for a failure before waiting on the peer. A split with a
+            // failed half can never complete, and while it sits here
+            // is_splitting blocks every later attempt to repair the page it
+            // was splitting — including an update that would have worked.
+            if ((s.first.result && !s.first.result->ok()) ||
+                (s.second.result && !s.second.result->ok())) {
+                // An ordinary error; InvalidCursor resets before we get here.
+                // Drop the split and leave the page it was repairing in place.
+                // The next update of that page tries again. Retrying from here
+                // instead would re-subscribe the same failing query, whose
+                // cached error is delivered synchronously, and recurse.
                 splits.erase(splits.begin() + static_cast<std::ptrdiff_t>(index));
                 return;
             }
+            if (!s.first.result || !s.second.result) return;
         }
         pending_split done = std::move(splits[index]);
         splits.erase(splits.begin() + static_cast<std::ptrdiff_t>(index));
