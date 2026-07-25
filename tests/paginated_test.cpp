@@ -660,6 +660,97 @@ TEST(Paginated, MovingPageBoundariesStillHitTheCap) {
         << "the pages before the failure stay visible";
 }
 
+TEST(Paginated, SplitBeforeTheFailingPageDoesNotClearTheBudget) {
+    // The failure marker is a position, and a completing split inserts a page.
+    // A half of an *earlier* page must not be mistaken for the failing range
+    // coming back healthy, or a first page that keeps splitting refills the
+    // budget forever.
+    harness h;
+    const json bad = page_value({"z"}, false, "end", "SplitRequired");
+    version ts{0, TS0};
+    auto send = [&](int query, const json& value, const char* journal) {
+        h.transport->server_send(0, transition_page(ts, {ts.query_set + 1, TS1}, query, value,
+                                                    journal));
+        ts = {ts.query_set + 1, TS1};
+    };
+
+    // Round one: page two is unrepairable. Budget 1, marker at index 1.
+    send(0, page_value({"a", "b"}, false, "c1"), "j0");
+    ASSERT_TRUE(h.wait_status(pagination_status::can_load_more));
+    ASSERT_TRUE(h.pq.load_more(2));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(1).empty(); }));
+    send(1, bad, "j1");
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(2).empty(); }));
+
+    // Round two: the new first page is oversized and splits, inserting a page
+    // ahead of the failing position.
+    send(2, page_value({"a", "b", "c", "d", "e"}, false, "c1", nullptr, "s0"), "j2");
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(4).empty(); }));
+    send(3, page_value({"a", "b"}, false, "s0"), "j3");
+    send(4, page_value({"c", "d", "e"}, false, "c1"), "j4");
+    ASSERT_TRUE(h.wait_status(pagination_status::can_load_more));
+    ASSERT_EQ(h.pq.snapshot().results.size(), 5u) << "the split landed";
+
+    // The same bad range again: budget 2, not 1.
+    ASSERT_TRUE(h.pq.load_more(2));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(5).empty(); }));
+    send(5, bad, "j5");
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(6).empty(); }));
+
+    // Round three: budget 3 trips the cap.
+    send(6, page_value({"a", "b"}, false, "c1"), "j6");
+    ASSERT_TRUE(h.wait_status(pagination_status::can_load_more));
+    ASSERT_TRUE(h.pq.load_more(2));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(7).empty(); }));
+    send(7, bad, "j7");
+    ASSERT_TRUE(h.wait_status(pagination_status::error));
+    EXPECT_EQ(h.pq.snapshot().results, items({"a", "b"}));
+}
+
+TEST(Paginated, InvalidCursorAfterTheCapStartsCleanInsteadOfStranding) {
+    // The capped error keeps the failing subscription alive so the range can
+    // heal. If that subscription reports InvalidCursor instead, the fresh
+    // session has no page at the failing position — carrying the capped state
+    // into it would leave an error nothing could clear.
+    harness h;
+    const json bad = page_value({"z"}, false, "end", "SplitRequired");
+    version ts{0, TS0};
+    int query = 0;
+    for (int round = 0; round < 3; ++round) {
+        h.transport->server_send(0, transition_page(ts, {ts.query_set + 1, TS1}, query,
+                                                    page_value({"a", "b"}, false, "c1"), "j0"));
+        ts = {ts.query_set + 1, TS1};
+        ASSERT_TRUE(h.wait_status(pagination_status::can_load_more)) << "round " << round;
+        ASSERT_TRUE(h.pq.load_more(2));
+        ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(query + 1).empty(); }));
+        h.transport->server_send(0, transition_page(ts, {ts.query_set + 1, TS2}, query + 1, bad,
+                                                    "j1"));
+        ts = {ts.query_set + 1, TS2};
+        if (round < 2) {
+            ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(query + 2).empty(); }));
+            query += 2;
+        }
+    }
+    ASSERT_TRUE(h.wait_status(pagination_status::error));
+    const int failing_query = query + 1;
+
+    // The still-live failing subscription now reports InvalidCursor.
+    h.transport->server_send(
+        0, transition_failed(ts, {ts.query_set + 1, TS3}, failing_query,
+                             "InvalidCursor: Tried to run a query starting from a cursor "
+                             "created by a different query"));
+    ts = {ts.query_set + 1, TS3};
+    ASSERT_TRUE(h.wait_status(pagination_status::loading_first_page));
+    EXPECT_FALSE(h.pq.snapshot().error.has_value()) << "the capped error must not survive";
+
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(failing_query + 1).empty(); }));
+    h.transport->server_send(
+        0, transition_page(ts, {ts.query_set + 1, TS4}, failing_query + 1,
+                           page_value({"x", "y"}, true, "d1"), "k0"));
+    ASSERT_TRUE(h.wait_status(pagination_status::exhausted));
+    EXPECT_EQ(h.pq.snapshot().results, items({"x", "y"}));
+}
+
 TEST(Paginated, RepeatedFailedRequiredSplitHitsTheCap) {
     // A SplitRequired page that *has* a split cursor is still incomplete, so
     // seeing it again must not count as progress. Otherwise the failing-half

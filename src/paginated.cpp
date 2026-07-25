@@ -337,6 +337,13 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         const page_key first_key = done.first.key;
         const page_key second_key = done.second.key;
         *it = std::move(done.first);  // unsubscribes the page being replaced
+        // One page becomes two, so everything after it moves down. The failure
+        // marker is a position, so it has to move with them — otherwise a half
+        // of an earlier page lands on the marker and looks like the failing
+        // range came back healthy.
+        if (failing_index && static_cast<std::size_t>(at) < *failing_index) {
+            ++(*failing_index);
+        }
         pages.insert(pages.begin() + at + 1, std::move(done.second));
         // A half can be oversized in its own right (the range it inherited
         // may still be too big), so keep splitting until it isn't.
@@ -412,7 +419,11 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         if (p == nullptr) return;
         p->result = r;
         if (is_invalid_cursor(r)) {
-            do_reset();
+            // The cursors went stale, so the ranges the failure count was
+            // about no longer mean anything — and the page it points at may
+            // not exist in the new session, which would strand a capped error
+            // at an index nothing can reach. Start genuinely fresh.
+            hard_reset();
         } else if (const auto index = split_of_half(key); index) {
             advance_split(*index);
         } else {
