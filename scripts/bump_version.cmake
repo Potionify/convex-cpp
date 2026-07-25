@@ -1,5 +1,6 @@
-# Bumps the library version (include/convex/version.h), commits, and creates
-# the matching annotated tag. Run from anywhere inside the repo:
+# Bumps the library version (include/convex/version.h and the README's
+# FetchContent pin), commits, and creates the matching annotated tag. Run from
+# anywhere inside the repo:
 #
 #   cmake -DBUMP=patch -P scripts/bump_version.cmake    # 0.1.0 -> 0.1.1
 #   cmake -DBUMP=minor -P scripts/bump_version.cmake    # 0.1.0 -> 0.2.0
@@ -10,9 +11,18 @@
 # Or use the wrappers (no quoting needed): scripts/bump_version.bat patch
 # on Windows, scripts/bump_version.sh patch on Linux/macOS.
 #
-# Then publish (this triggers the release workflow):
+# Publishing. The release workflow triggers on the tag, and git does not push
+# tags by default — neither does a plain `git push` nor the Push button in a
+# GUI client. A tag left behind that way looks like a release that silently
+# never happened. So this script sets push.followTags in the repo's local
+# config, which makes every subsequent push carry annotated tags reachable
+# from the commits it sends. Publish with either:
 #
-#   git push origin main --tags
+#   cmake -DBUMP=patch -DPUSH=ON -P scripts/bump_version.cmake   # bump + push
+#   git push origin main                                        # after a bump
+#
+# Both send the tag. `git push origin main --tags` still works and is what to
+# use if an earlier tag was stranded locally.
 
 if(NOT DEFINED BUMP)
     message(FATAL_ERROR "Pass -DBUMP=major|minor|patch|x.y.z (the -D must come before -P)")
@@ -62,7 +72,24 @@ foreach(part MAJOR MINOR PATCH)
 endforeach()
 file(WRITE "${version_h}" "${content}")
 
-execute_process(COMMAND git -C "${repo_root}" add include/convex/version.h
+# The README's FetchContent snippet pins a tag. Left to a human it goes stale
+# silently, and a stale pin hands every new user an old library.
+set(readme "${repo_root}/README.md")
+file(READ "${readme}" readme_content)
+if(NOT readme_content MATCHES "GIT_TAG v[0-9]+\\.[0-9]+\\.[0-9]+")
+    message(FATAL_ERROR "No 'GIT_TAG vX.Y.Z' pin found in ${readme}; update it by hand "
+                        "or fix this script's pattern")
+endif()
+string(REGEX REPLACE "GIT_TAG v[0-9]+\\.[0-9]+\\.[0-9]+" "GIT_TAG v${new_version}"
+       readme_content "${readme_content}")
+file(WRITE "${readme}" "${readme_content}")
+
+# Make an ordinary push carry the tag. Without this the release workflow waits
+# on a tag that never arrives, and the failure is silent.
+execute_process(COMMAND git -C "${repo_root}" config --local push.followTags true
+                COMMAND_ERROR_IS_FATAL ANY)
+
+execute_process(COMMAND git -C "${repo_root}" add include/convex/version.h README.md
                 COMMAND_ERROR_IS_FATAL ANY)
 execute_process(COMMAND git -C "${repo_root}" commit -m "Release v${new_version}"
                 COMMAND_ERROR_IS_FATAL ANY)
@@ -70,4 +97,11 @@ execute_process(COMMAND git -C "${repo_root}" tag -a "v${new_version}" -m "v${ne
                 COMMAND_ERROR_IS_FATAL ANY)
 
 message(STATUS "${old_version} -> ${new_version}, committed and tagged v${new_version}")
-message(STATUS "Publish with: git push origin main --tags")
+
+if(PUSH)
+    execute_process(COMMAND git -C "${repo_root}" push origin HEAD "v${new_version}"
+                    COMMAND_ERROR_IS_FATAL ANY)
+    message(STATUS "Pushed the release commit and tag v${new_version}")
+else()
+    message(STATUS "Publish with: git push origin main   (push.followTags carries the tag)")
+endif()
