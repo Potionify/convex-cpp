@@ -143,6 +143,9 @@ curl -X POST https://<your-deployment>.convex.cloud/api/query \
 - `messages:list` (query): args `{channel}`, returns messages oldest-first.
 - `messages:listPaginated` (query): args `{channel, paginationOpts}`, returns
   a `PaginationResult` page of messages oldest-first (for `paginated_query`).
+- `messages:listPaginatedDesc` (query): the same, newest-first. Inserts land
+  inside the first page's range, so this is the one that grows a page past
+  its requested size and makes `paginated_query` split it.
 - `messages:send` (mutation): args `{channel, author, body}`, returns the new id.
 - `messages:clearAll` (mutation): no args, deletes all, returns count removed.
 - `counters:get` (query): args `{name}`, returns `number | null`.

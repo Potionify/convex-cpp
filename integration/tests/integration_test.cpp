@@ -8,6 +8,7 @@
 //   CONVEX_CLOUD_URL       enables the TLS smoke test against a cloud dev
 //                          deployment when set (wss://)
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -267,6 +268,79 @@ TEST(Live, PaginatedQueryChainsPagesAndSeesLiveInserts) {
     EXPECT_EQ(final_snap.status, pagination_status::exhausted);
     EXPECT_EQ(bodies(final_snap),
               (std::vector<std::string>{"m1", "m2", "m3", "m4", "m5", "m6"}));
+}
+
+TEST(Live, PaginatedQuerySplitsAGrowingPage) {
+    // Newest-first, so every insert lands inside the first page's cursor
+    // range rather than after the last page. That is how a page outgrows the
+    // size it was requested at, and what page splitting exists to handle.
+    auto c = make_client(local_url());
+    const std::string channel = unique_name("split");
+
+    auto send = [&](const std::string& body) {
+        auto m = c.mutation("messages:send", {{"channel", value(channel)},
+                                              {"author", value("cpp")},
+                                              {"body", value(body)}});
+        ASSERT_TRUE(await(m).ok());
+    };
+    for (int i = 1; i <= 3; ++i) send("m" + std::to_string(i));
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<paginated_snapshot> snaps;
+    paginated_query pq(
+        c, {"messages:listPaginatedDesc", {{"channel", value(channel)}}, /*initial_num_items=*/2},
+        [&](const paginated_snapshot& s) {
+            std::lock_guard lk(mu);
+            snaps.push_back(s);
+            cv.notify_all();
+        });
+    auto wait_snap = [&](auto pred) {
+        std::unique_lock lk(mu);
+        return cv.wait_for(lk, 15s, [&] { return !snaps.empty() && pred(snaps.back()); });
+    };
+    auto bodies = [](const paginated_snapshot& s) {
+        std::vector<std::string> out;
+        for (const value& doc : s.results) out.push_back(doc.as_object().at("body").as_string());
+        return out;
+    };
+
+    ASSERT_TRUE(wait_snap([](const paginated_snapshot& s) {
+        return s.status == pagination_status::can_load_more && s.results.size() == 2;
+    }));
+    ASSERT_TRUE(pq.load_more(2));
+    ASSERT_TRUE(wait_snap(
+        [](const paginated_snapshot& s) { return s.status == pagination_status::exhausted; }));
+    EXPECT_EQ(bodies(pq.snapshot()), (std::vector<std::string>{"m3", "m2", "m1"}));
+
+    // Three more inserts push the first page from 2 items to 5, past twice
+    // the size it was requested at. The helper splits it against the real
+    // server's splitCursor; the list must stay whole and in order through it.
+    for (int i = 4; i <= 6; ++i) send("m" + std::to_string(i));
+    ASSERT_TRUE(wait_snap([](const paginated_snapshot& s) { return s.results.size() == 6; }));
+    const auto after_split = pq.snapshot();
+    EXPECT_EQ(after_split.status, pagination_status::exhausted);
+    EXPECT_EQ(bodies(after_split),
+              (std::vector<std::string>{"m6", "m5", "m4", "m3", "m2", "m1"}));
+
+    // No snapshot along the way may repeat an item: the halves replace the
+    // page they split only once both have loaded.
+    std::vector<std::string> worst;
+    {
+        std::lock_guard lk(mu);
+        for (const paginated_snapshot& s : snaps) {
+            std::vector<std::string> seen = bodies(s);
+            std::sort(seen.begin(), seen.end());
+            const auto dup = std::adjacent_find(seen.begin(), seen.end());
+            if (dup != seen.end()) worst = bodies(s);
+        }
+    }
+    EXPECT_TRUE(worst.empty()) << "a snapshot showed an item twice: " << testing::PrintToString(worst);
+
+    // The list still grows from the last page after the split.
+    send("m7");
+    ASSERT_TRUE(wait_snap([](const paginated_snapshot& s) { return s.results.size() == 7; }));
+    EXPECT_EQ(bodies(pq.snapshot()).front(), "m7");
 }
 
 TEST(Live, ConvexErrorCarriesData) {

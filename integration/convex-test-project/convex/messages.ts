@@ -27,6 +27,20 @@ export const listPaginated = query({
   },
 });
 
+// Paginated list of messages, newest first. Inserts land inside the first
+// page's cursor range instead of after the last page, so this is the query
+// the paginated_query page-splitting test grows a page with.
+export const listPaginatedDesc = query({
+  args: { channel: v.string(), paginationOpts: paginationOptsValidator },
+  handler: async (ctx, { channel, paginationOpts }) => {
+    return await ctx.db
+      .query("messages")
+      .withIndex("by_channel", (q) => q.eq("channel", channel))
+      .order("desc")
+      .paginate(paginationOpts);
+  },
+});
+
 // Send (insert) a new message. Returns the new document id.
 export const send = mutation({
   args: {

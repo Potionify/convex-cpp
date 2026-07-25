@@ -11,12 +11,29 @@
 // (paginationOptsValidator) and return a PaginationResult:
 //   { page: [...], isDone: bool, continueCursor: string }.
 //
-// Divergence from convex-js (v1): page splitting is NOT implemented. When
-// the server reports pageStatus == "SplitRequired" (a page grew past the
-// read limits and may be incomplete), convex-js splits the page in two via
-// splitCursor; this helper instead resets pagination, which re-fetches
-// correctly-sized pages. "SplitRecommended" is ignored. Revisit if reset
-// churn ever matters in practice.
+// Page splitting. A page's range is fixed by its journal, so inserts into
+// that range make the page grow; left alone it eventually outgrows the
+// server's read limits and comes back incomplete. Like convex-js, this
+// helper splits such a page in two at the server-supplied splitCursor —
+// subscribing both halves with explicit cursor/endCursor bounds and swapping
+// them in for the original only once both have loaded, so the combined list
+// is gapless and duplicate-free at every moment. A page is split when the
+// server reports pageStatus "SplitRequired" or "SplitRecommended", or when
+// it has grown past twice initial_num_items.
+//
+// A page the server reports as SplitRequired may be missing part of its
+// range, so the snapshot stops before it: the pages ahead of it stay visible
+// and the status goes back to loading until a split repairs it. A list with a
+// hole in it is worse than a shorter list. convex-js's usePaginatedQuery does
+// the same.
+//
+// Nothing here forces the issue beyond that. If the server reports a page
+// incomplete but gives no splitCursor to split it on, the page simply stays
+// out of the snapshot; its subscription is live, so a later result that fits
+// the read limits repairs it. A query heavy enough that no page ever fits
+// leaves the list loading indefinitely — again matching convex-js, which has
+// no recovery path for that case either. The alternative, re-fetching the
+// whole session to force the issue, is a loop with nothing to bound it.
 //
 // Threading. All callbacks (page updates) arrive through the owning client's
 // delivery mechanism — the process_events() pump by default. The on_update
@@ -87,8 +104,9 @@ struct paginated_impl;
 ///
 /// Pagination resets — dropping every page and re-subscribing a fresh first
 /// page with a new cache-buster id — happen when set_args() changes the
-/// arguments, when a page fails with InvalidCursor (cursors went stale), or
-/// when the server reports a page as SplitRequired (see file comment).
+/// arguments, when reset() is called, and when a page fails with InvalidCursor
+/// (cursors went stale). Splitting an oversized page is not a reset: loaded
+/// pages stay put.
 class paginated_query {
 public:
     using snapshot_callback = std::function<void(const paginated_snapshot&)>;
