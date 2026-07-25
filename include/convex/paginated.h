@@ -19,10 +19,19 @@
 // them in for the original only once both have loaded, so the combined list
 // is gapless and duplicate-free at every moment. A page is split when the
 // server reports pageStatus "SplitRequired" or "SplitRecommended", or when
-// it has grown past twice initial_num_items. An incomplete page with no
-// splitCursor (too few items to have a split point) cannot be repaired that
-// way and resets pagination instead; if re-fetching keeps producing one, the
-// helper stops resetting and reports an error rather than looping.
+// it has grown past twice initial_num_items.
+//
+// An incomplete page that cannot be repaired by splitting — no splitCursor to
+// split on, or a half that fails — resets pagination instead. That reset is
+// counted per page range, and after a few tries on the same range the helper
+// stops resetting and reports an error rather than looping forever. A page
+// that is merely oversized (complete, but larger than asked for) is never
+// reset: if its split fails, it stays as it is.
+//
+// Known, and deliberate for parity with convex-js: between a SplitRequired
+// update arriving and both halves loading, the incomplete page is what the
+// snapshot shows. If the server truncated it, the list has a gap for that one
+// round trip. convex-js splits from the updated page result the same way.
 //
 // Threading. All callbacks (page updates) arrive through the owning client's
 // delivery mechanism — the process_events() pump by default. The on_update

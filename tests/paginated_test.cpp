@@ -546,11 +546,57 @@ TEST(Paginated, RepeatedUnsplittablePageStopsResettingAndErrors) {
     EXPECT_EQ(h.pq.snapshot().results, items({"x"}));
 }
 
-TEST(Paginated, FailedSplitHalfKeepsTheOriginalPage) {
+TEST(Paginated, UnrepairablePageAfterTheFirstAlsoHitsTheCap) {
+    // The reset count follows the failing range, not the session. A reset
+    // reloads a healthy first page every time, so counting that as progress
+    // would let a bad second page reset forever.
+    harness h;
+    const json good = page_value({"a", "b"}, false, "c1");
+    const json bad = page_value({"c"}, false, "c2", "SplitRequired");
+
+    // (first page ok, load_more, second page unrepairable) x3. The first two
+    // rounds reset; the third gives up.
+    int query = 0;
+    version ts{0, TS0};
+    for (int round = 0; round < 3; ++round) {
+        const int first = query;
+        const int second = query + 1;
+        h.transport->server_send(0, transition_page(ts, {ts.query_set + 1, TS1}, first, good,
+                                                    "j0"));
+        ts = {ts.query_set + 1, TS1};
+        ASSERT_TRUE(h.wait_status(pagination_status::can_load_more)) << "round " << round;
+        ASSERT_TRUE(h.pq.load_more(2)) << "round " << round;
+        ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(second).empty(); }));
+        EXPECT_EQ(h.opts_for(second)["cursor"], "c1") << "round " << round;
+
+        h.transport->server_send(0, transition_page(ts, {ts.query_set + 1, TS2}, second, bad,
+                                                    "j1"));
+        ts = {ts.query_set + 1, TS2};
+        if (round < 2) {
+            // Reset: both pages dropped, a fresh first page subscribed.
+            ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(second + 1).empty(); }))
+                << "round " << round << " should have reset";
+            EXPECT_TRUE(h.opts_for(second + 1)["cursor"].is_null());
+            query = second + 1;
+        }
+    }
+
+    ASSERT_TRUE(h.wait_status(pagination_status::error));
+    const auto snap = h.pq.snapshot();
+    ASSERT_TRUE(snap.error.has_value());
+    EXPECT_NE(snap.error->error_message().find("SplitRequired"), std::string::npos);
+    const std::size_t sent = h.transport->sent(0).size();
+    h.settle();
+    EXPECT_EQ(h.transport->sent(0).size(), sent) << "no further reset traffic";
+}
+
+TEST(Paginated, FailedOptionalSplitKeepsTheCompletePage) {
+    // Oversized but complete (no pageStatus): if the split fails there is
+    // nothing wrong with the page itself, so keep it and stop retrying.
     harness h;
     h.transport->server_send(
         0, transition_page({0, TS0}, {1, TS1}, 0,
-                           page_value({"a", "b", "c", "d"}, false, "c1", "SplitRequired", "s1"),
+                           page_value({"a", "b", "c", "d", "e"}, false, "c1", nullptr, "s1"),
                            "j0"));
     ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(2).empty(); }));
 
@@ -562,18 +608,47 @@ TEST(Paginated, FailedSplitHalfKeepsTheOriginalPage) {
     ASSERT_TRUE(pump_until(h.c, [&] { return h.sent_remove(1) && h.sent_remove(2); }));
     const auto snap = h.pq.snapshot();
     EXPECT_EQ(snap.status, pagination_status::can_load_more) << "a failed split is not an error";
-    EXPECT_EQ(snap.results, items({"a", "b", "c", "d"}));
-    EXPECT_FALSE(h.sent_remove(0));
+    EXPECT_EQ(snap.results, items({"a", "b", "c", "d", "e"}));
+    EXPECT_FALSE(h.sent_remove(0)) << "the page is complete: no reset";
 
     // The same page updating again must not retry the failing split.
     const std::size_t sent = h.transport->sent(0).size();
     h.transport->server_send(
         0, transition_page({3, TS3}, {4, TS4}, 0,
-                           page_value({"a", "b", "c", "d", "e"}, false, "c1", "SplitRequired",
-                                      "s1"),
+                           page_value({"a", "b", "c", "d", "e", "f"}, false, "c1", nullptr, "s1"),
                            "j0b"));
-    ASSERT_TRUE(pump_until(h.c, [&] { return h.pq.snapshot().results.size() == 5; }));
+    ASSERT_TRUE(pump_until(h.c, [&] { return h.pq.snapshot().results.size() == 6; }));
     EXPECT_EQ(h.transport->sent(0).size(), sent) << "no retry of the failed split";
+}
+
+TEST(Paginated, FailedRequiredSplitResetsInsteadOfKeepingAGap) {
+    // SplitRequired means the page is missing items. If the split that would
+    // repair it fails, keeping the page would show that gap forever, so this
+    // falls back to the (capped) reset.
+    harness h;
+    h.transport->server_send(
+        0, transition_page({0, TS0}, {1, TS1}, 0,
+                           page_value({"a", "b", "c", "d"}, false, "c1", "SplitRequired", "s1"),
+                           "j0"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(2).empty(); }));
+
+    h.transport->server_send(
+        0, transition_page({1, TS1}, {2, TS2}, 1, page_value({"a", "b"}, false, "s1"), "j1"));
+    h.transport->server_send(
+        0, transition_failed({2, TS2}, {3, TS3}, 2, "Server Error: Uncaught Error: boom"));
+
+    ASSERT_TRUE(h.wait_status(pagination_status::loading_first_page));
+    EXPECT_TRUE(h.pq.snapshot().results.empty());
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(3).empty(); }));
+    EXPECT_TRUE(h.sent_remove(0)) << "the incomplete page is dropped, not kept";
+    const json opts = h.opts_for(3);
+    EXPECT_TRUE(opts["cursor"].is_null());
+    EXPECT_NE(opts["id"].get<double>(), h.pagination_id(0)) << "a reset is a new session";
+
+    h.transport->server_send(
+        0, transition_page({3, TS3}, {4, TS4}, 3, page_value({"a", "b"}, false, "e1"), "k0"));
+    ASSERT_TRUE(h.wait_status(pagination_status::can_load_more));
+    EXPECT_EQ(h.pq.snapshot().results, items({"a", "b"}));
 }
 
 TEST(Paginated, InvalidCursorInASplitHalfResetsPagination) {
