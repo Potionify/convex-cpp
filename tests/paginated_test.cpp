@@ -616,9 +616,130 @@ TEST(Paginated, UnrepairablePageAfterTheFirstAlsoHitsTheCap) {
     const auto snap = h.pq.snapshot();
     ASSERT_TRUE(snap.error.has_value());
     EXPECT_NE(snap.error->error_message().find("SplitRequired"), std::string::npos);
+    EXPECT_EQ(snap.results, items({"a", "b"}))
+        << "the healthy prefix survives the error, like any page error";
     const std::size_t sent = h.transport->sent(0).size();
     h.settle();
     EXPECT_EQ(h.transport->sent(0).size(), sent) << "no further reset traffic";
+}
+
+TEST(Paginated, MovingPageBoundariesStillHitTheCap) {
+    // Same shape as the test above, but page one's continueCursor moves every
+    // round, the way a newest-first feed behaves under inserts. The failure
+    // count must not restart just because the bad page now starts elsewhere.
+    harness h;
+    const char* cursors[] = {"c1", "c2", "c3", "c4"};
+    int query = 0;
+    version ts{0, TS0};
+    for (int round = 0; round < 3; ++round) {
+        const int first = query;
+        const int second = query + 1;
+        h.transport->server_send(
+            0, transition_page(ts, {ts.query_set + 1, TS1}, first,
+                               page_value({"a", "b"}, false, cursors[round]), "j0"));
+        ts = {ts.query_set + 1, TS1};
+        ASSERT_TRUE(h.wait_status(pagination_status::can_load_more)) << "round " << round;
+        ASSERT_TRUE(h.pq.load_more(2)) << "round " << round;
+        ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(second).empty(); }));
+        EXPECT_EQ(h.opts_for(second)["cursor"], cursors[round]) << "boundary moved";
+
+        h.transport->server_send(0, transition_page(ts, {ts.query_set + 1, TS2}, second,
+                                                    page_value({"z"}, false, "end",
+                                                               "SplitRequired"),
+                                                    "j1"));
+        ts = {ts.query_set + 1, TS2};
+        if (round < 2) {
+            ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(second + 1).empty(); }))
+                << "round " << round << " should have reset";
+            query = second + 1;
+        }
+    }
+
+    ASSERT_TRUE(h.wait_status(pagination_status::error));
+    EXPECT_EQ(h.pq.snapshot().results, items({"a", "b"}))
+        << "the pages before the failure stay visible";
+}
+
+TEST(Paginated, RepeatedFailedRequiredSplitHitsTheCap) {
+    // A SplitRequired page that *has* a split cursor is still incomplete, so
+    // seeing it again must not count as progress. Otherwise the failing-half
+    // loop refills its own budget and never terminates.
+    harness h;
+    const json bad = page_value({"a", "b", "c", "d"}, false, "c1", "SplitRequired", "s1");
+    int query = 0;
+    version ts{0, TS0};
+    for (int round = 0; round < 3; ++round) {
+        h.transport->server_send(0, transition_page(ts, {ts.query_set + 1, TS1}, query, bad,
+                                                    "j0"));
+        ts = {ts.query_set + 1, TS1};
+        // Two halves go out; one of them fails.
+        ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(query + 2).empty(); }))
+            << "round " << round;
+        h.transport->server_send(0, transition_page(ts, {ts.query_set + 1, TS2}, query + 1,
+                                                    page_value({"a", "b"}, false, "s1"), "j1"));
+        ts = {ts.query_set + 1, TS2};
+        h.transport->server_send(0, transition_failed(ts, {ts.query_set + 1, TS3}, query + 2,
+                                                      "Server Error: Uncaught Error: boom"));
+        ts = {ts.query_set + 1, TS3};
+        if (round < 2) {
+            ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(query + 3).empty(); }))
+                << "round " << round << " should have reset";
+            query += 3;
+        }
+    }
+    ASSERT_TRUE(h.wait_status(pagination_status::error));
+    ASSERT_TRUE(h.pq.snapshot().error.has_value());
+    EXPECT_NE(h.pq.snapshot().error->error_message().find("SplitRequired"), std::string::npos);
+}
+
+TEST(Paginated, DisabledSplitPageThatTurnsIncompleteIsStillRepaired) {
+    // A failed optional split disables splitting for that page. If the page
+    // later goes incomplete, the flag must not silence it: nothing else would
+    // be in flight, and the snapshot hides incomplete pages.
+    harness h;
+    h.transport->server_send(
+        0, transition_page({0, TS0}, {1, TS1}, 0,
+                           page_value({"a", "b", "c", "d", "e"}, false, "c1", nullptr, "s1"),
+                           "j0"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(2).empty(); }));
+    h.transport->server_send(
+        0, transition_page({1, TS1}, {2, TS2}, 1, page_value({"a", "b"}, false, "s1"), "j1"));
+    h.transport->server_send(
+        0, transition_failed({2, TS2}, {3, TS3}, 2, "Server Error: Uncaught Error: boom"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return h.sent_remove(1) && h.sent_remove(2); }));
+    ASSERT_EQ(h.pq.snapshot().status, pagination_status::can_load_more);
+
+    // The page keeps growing and the server now calls it incomplete.
+    h.transport->server_send(
+        0, transition_page({3, TS3}, {4, TS4}, 0,
+                           page_value({"a", "b", "c", "d", "e", "f"}, false, "c1",
+                                      "SplitRequired", "s1"),
+                           "j0b"));
+    ASSERT_TRUE(h.wait_status(pagination_status::loading_first_page))
+        << "must not sit on an incomplete page with nothing in flight";
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(3).empty(); }));
+    EXPECT_TRUE(h.sent_remove(0));
+    EXPECT_TRUE(h.opts_for(3)["cursor"].is_null());
+}
+
+TEST(Paginated, RangeThatHealsItselfLeavesTheErrorState) {
+    // The cap does not unsubscribe, so the failing page keeps updating. If the
+    // data changes and it comes back whole, the helper must recover on its own.
+    harness h;
+    const json bad = page_value({"a"}, false, "c1", "SplitRequired");
+    h.transport->server_send(0, transition_page({0, TS0}, {1, TS1}, 0, bad, "j0"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(1).empty(); }));
+    h.transport->server_send(0, transition_page({1, TS1}, {2, TS2}, 1, bad, "j1"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(2).empty(); }));
+    h.transport->server_send(0, transition_page({2, TS2}, {3, TS3}, 2, bad, "j2"));
+    ASSERT_TRUE(h.wait_status(pagination_status::error));
+
+    // Same subscription, healthy result this time.
+    h.transport->server_send(
+        0, transition_page({3, TS3}, {4, TS4}, 2, page_value({"a", "b"}, true, "c1"), "j2b"));
+    ASSERT_TRUE(h.wait_status(pagination_status::exhausted));
+    EXPECT_EQ(h.pq.snapshot().results, items({"a", "b"}));
+    EXPECT_FALSE(h.pq.snapshot().error.has_value());
 }
 
 TEST(Paginated, FailedOptionalSplitKeepsTheCompletePage) {
