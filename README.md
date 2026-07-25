@@ -61,7 +61,7 @@ include(FetchContent)
 FetchContent_Declare(
     convex
     GIT_REPOSITORY https://github.com/Potionify/convex-cpp.git
-    GIT_TAG v0.1.0
+    GIT_TAG v0.1.2
 )
 set(CONVEX_WITH_IXWEBSOCKET ON)  # bundled desktop transport; omit if you supply your own
 FetchContent_MakeAvailable(convex)
