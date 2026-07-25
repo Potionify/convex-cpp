@@ -234,7 +234,7 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         s.first.key = ++next_key;
         // The first half starts where the original page started — NOT at the
         // beginning of the query. convex-js sent a null cursor here, which
-        // duplicated every item before the page (get-convex/convex-js#54981).
+        // duplicated every item before the page (convex-js commit 7ceee3e).
         s.first.cursor = orig->cursor;
         s.first.end_cursor = split_cursor;
         s.second.key = ++next_key;

@@ -472,7 +472,7 @@ TEST(Paginated, IncompletePageHidesItselfButNotThePagesBeforeIt) {
 }
 
 TEST(Paginated, SplitFirstHalfStartsAtTheOriginalPagesCursor) {
-    // Regression guard for get-convex/convex-js#54981: convex-js sent a null
+    // Regression guard for convex-js commit 7ceee3e: convex-js sent a null
     // cursor for the first half, so splitting any page but the first re-read
     // the list from the beginning and duplicated everything before it.
     harness h;
