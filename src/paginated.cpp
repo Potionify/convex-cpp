@@ -12,12 +12,6 @@ namespace convex {
 
 namespace {
 
-/// How many times in a row one incomplete page that cannot be repaired may
-/// reset the session before the helper gives up and reports an error. Each
-/// reset re-runs the query under a new cache-buster id, so a page that always
-/// comes back the same way would otherwise loop forever.
-constexpr unsigned MAX_UNREPAIRABLE_RESETS = 2;
-
 /// Cache-buster shared with every helper instance in the process, mirroring
 /// convex-js's module-global counter. A unique id per pagination session
 /// keeps its pages' query journals independent (no deduplication onto an
@@ -133,9 +127,6 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         /// both ends of their range so the two of them cover exactly what
         /// the page they replace covered.
         std::optional<std::string> end_cursor;
-        /// Set when a split of this page failed, so it is not retried on
-        /// every subsequent update of the same page.
-        bool split_disabled = false;
     };
 
     /// A split in flight: two half-pages loading in parallel while the page
@@ -152,21 +143,6 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
     /// Splits in flight. Their halves are not in `pages` yet.
     std::vector<pending_split> splits;
     page_key next_key = 0;
-    /// Position of the page that could not be repaired, and how many resets in
-    /// a row it has caused. Positional on purpose: a start cursor moves as the
-    /// list changes underneath (on a newest-first feed every insert shifts the
-    /// page boundaries), so keying this on the cursor would make each failure
-    /// look like a new one and the count would never build. Counting per
-    /// session does not work either — a reset reloads the first page, which is
-    /// usually healthy, and calling that progress clears the count before the
-    /// consumer can page back down to the page that is actually broken. So:
-    /// count every consecutive failure, and clear only once the session gets
-    /// back to that position with a complete page.
-    std::optional<std::size_t> failing_index;
-    unsigned unrepairable_resets = 0;
-    /// Set when those resets hit MAX_UNREPAIRABLE_RESETS: the query cannot
-    /// return a complete page there, so the snapshot reports an error instead.
-    bool unrepairable_page = false;
 
     paginated_impl(client& c, paginated_query::options&& o,
                    paginated_query::snapshot_callback&& cb)
@@ -187,15 +163,6 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
             if (s.second.key == key) return &s.second;
         }
         return nullptr;
-    }
-
-    // Requires `m`. Position of an active page, or nullopt if `key` is not one
-    // (a split half, or already gone).
-    std::optional<std::size_t> index_of(page_key key) const {
-        for (std::size_t i = 0; i < pages.size(); ++i) {
-            if (pages[i].key == key) return i;
-        }
-        return std::nullopt;
     }
 
     // Requires `m`. Index into `splits` of the split `key` is a half of.
@@ -256,15 +223,6 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         add_page(initial_num_items, std::nullopt);
     }
 
-    // Requires `m`. A caller-driven reset (new args, or reset()) also clears
-    // the unrepairable-page state: the query may well behave differently now.
-    void hard_reset() {
-        failing_index.reset();
-        unrepairable_resets = 0;
-        unrepairable_page = false;
-        do_reset();
-    }
-
     // Requires `m`. Starts replacing `original` with two halves covering the
     // same range: (cursor, split_cursor] and (split_cursor, continue_cursor].
     void start_split(page_key original, const std::string& split_cursor,
@@ -291,14 +249,6 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         if (page* p = find_page(second_key)) subscribe_page(*p, initial_num_items);
     }
 
-    // Requires `m`. True when the server called this page's result incomplete,
-    // so leaving it in place means showing a gap.
-    bool page_is_incomplete(const page& p) const {
-        if (!p.result || !p.result->ok()) return false;
-        const auto f = parse_page(p.result->get_value());
-        return f && f->split_required;
-    }
-
     // Requires `m`. Called when a half of split `index` gets a result.
     void advance_split(std::size_t index) {
         {
@@ -306,24 +256,11 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
             if (!s.first.result || !s.second.result) return;
             if (!s.first.result->ok() || !s.second.result->ok()) {
                 // A half failed for a reason other than InvalidCursor (that
-                // resets before we get here). Abandon the split.
-                const page_key original = s.original;
+                // resets before we get here). Drop the split and leave the
+                // page it was repairing in place. The next update of that page
+                // tries again — one attempt per server transition, not a loop
+                // we drive ourselves.
                 splits.erase(splits.begin() + static_cast<std::ptrdiff_t>(index));
-                page* orig = find_page(original);
-                if (orig == nullptr) return;
-                if (page_is_incomplete(*orig)) {
-                    // The page being repaired is missing items. Keeping it
-                    // would show that gap forever, so fall back to the reset
-                    // path, which is capped and eventually reports.
-                    if (const auto at = index_of(original)) {
-                        reset_for_unrepairable_page(*at);
-                    }
-                    return;
-                }
-                // The page is complete, only too big. Keep it, and stop
-                // retrying a split that fails: otherwise every later update
-                // of the page runs the same failing query again.
-                orig->split_disabled = true;
                 return;
             }
         }
@@ -337,13 +274,6 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         const page_key first_key = done.first.key;
         const page_key second_key = done.second.key;
         *it = std::move(done.first);  // unsubscribes the page being replaced
-        // One page becomes two, so everything after it moves down. The failure
-        // marker is a position, so it has to move with them — otherwise a half
-        // of an earlier page lands on the marker and looks like the failing
-        // range came back healthy.
-        if (failing_index && static_cast<std::size_t>(at) < *failing_index) {
-            ++(*failing_index);
-        }
         pages.insert(pages.begin() + at + 1, std::move(done.second));
         // A half can be oversized in its own right (the range it inherited
         // may still be too big), so keep splitting until it isn't.
@@ -358,58 +288,16 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         page* p = find_page(key);
         if (p == nullptr || !p->result || !p->result->ok()) return;
         if (is_splitting(key)) return;
-        // Parse before looking at split_disabled: a page that was complete
-        // when its split failed can still turn incomplete later, and that
-        // needs the reset path rather than the flag's silence.
         const auto f = parse_page(p->result->get_value());
         if (!f) return;
-        const auto at = index_of(key);
-        if (f->split_required) {
-            if (!f->split_cursor || p->split_disabled) {
-                // Incomplete, and it cannot be repaired in place: either the
-                // server gave no split point, or splitting this page has
-                // already failed. Start over with right-sized pages.
-                if (at) reset_for_unrepairable_page(*at);
-                return;
-            }
-            // Still incomplete, so it is not progress — the failure count
-            // has to survive the split about to start below.
-        } else if (at) {
-            note_page_repaired(*at);
-        }
-        if (p->split_disabled) return;
+        // No split point means nothing to do: an incomplete page stays out of
+        // the snapshot, and its subscription is live, so a later result that
+        // fits the limits repairs it on its own.
         if (!f->split_cursor) return;
         if (f->split_required || f->split_recommended ||
             f->items->size() > initial_num_items * 2) {
             start_split(key, *f->split_cursor, f->continue_cursor);
         }
-    }
-
-    // Requires `m`. A complete page at or past the position that could not be
-    // repaired means the session got back to it and it is fine now, whatever
-    // its cursor has become. That ends the streak.
-    void note_page_repaired(std::size_t index) {
-        if (!failing_index || index < *failing_index) return;
-        failing_index.reset();
-        unrepairable_resets = 0;
-        // The failing page keeps its subscription after the cap trips, so a
-        // range that heals on its own has to be able to leave the error too.
-        unrepairable_page = false;
-    }
-
-    // Requires `m`. `index` is the position of the page that cannot be
-    // repaired. Every consecutive failure counts, whether or not it is at the
-    // same position as the last one: on a live list the boundaries move.
-    void reset_for_unrepairable_page(std::size_t index) {
-        ++unrepairable_resets;
-        failing_index = index;
-        if (unrepairable_resets > MAX_UNREPAIRABLE_RESETS) {
-            // Re-fetching keeps producing the same incomplete page, and each
-            // reset costs a fresh (uncached) query. Stop and report.
-            unrepairable_page = true;
-            return;
-        }
-        do_reset();
     }
 
     void on_page_result(std::uint64_t gen, page_key key, const function_result& r) {
@@ -419,11 +307,7 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         if (p == nullptr) return;
         p->result = r;
         if (is_invalid_cursor(r)) {
-            // The cursors went stale, so the ranges the failure count was
-            // about no longer mean anything — and the page it points at may
-            // not exist in the new session, which would strand a capped error
-            // at an index nothing can reach. Start genuinely fresh.
-            hard_reset();
+            do_reset();
         } else if (const auto index = split_of_half(key); index) {
             advance_split(*index);
         } else {
@@ -435,25 +319,9 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
     // Requires `m`.
     paginated_snapshot compute_snapshot() const {
         paginated_snapshot snap;
-        const auto unrepairable_error = [this] {
-            return function_result::error(
-                "convex: paginated query \"" + udf_path +
-                "\" keeps returning an incomplete page (pageStatus \"SplitRequired\") that "
-                "could not be repaired by splitting. Reduce initial_num_items, or make the "
-                "query read less data per item.");
-        };
         bool all_loaded = true;
         bool last_is_done = false;
-        for (std::size_t i = 0; i < pages.size(); ++i) {
-            const page& p = pages[i];
-            if (unrepairable_page && failing_index && i == *failing_index) {
-                // Report where the list actually stops, so the pages the
-                // caller could already see stay visible — the same shape as
-                // an ordinary page error.
-                snap.status = pagination_status::error;
-                snap.error = unrepairable_error();
-                return snap;
-            }
+        for (const page& p : pages) {
             if (!p.result) {
                 all_loaded = false;
                 break;
@@ -482,13 +350,6 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
             }
             snap.results.insert(snap.results.end(), f->items->begin(), f->items->end());
             last_is_done = f->is_done;
-        }
-        if (unrepairable_page) {
-            // The failing page is no longer where it was (a reset or a split
-            // moved it). Still an error; just report it at the end.
-            snap.status = pagination_status::error;
-            snap.error = unrepairable_error();
-            return snap;
         }
         if (!all_loaded) {
             snap.status = snap.results.empty() ? pagination_status::loading_first_page
@@ -559,7 +420,7 @@ bool paginated_query::set_args(value_object args) {
     if (impl_->stopped) return false;
     if (serialize_args(args) == serialize_args(impl_->user_args)) return false;
     impl_->user_args = std::move(args);
-    impl_->hard_reset();
+    impl_->do_reset();
     impl_->notify();
     return true;
 }
@@ -568,7 +429,7 @@ void paginated_query::reset() {
     if (!impl_) return;
     std::lock_guard lk(impl_->m);
     if (impl_->stopped) return;
-    impl_->hard_reset();
+    impl_->do_reset();
     impl_->notify();
 }
 
