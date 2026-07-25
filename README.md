@@ -17,8 +17,10 @@ On top of it, `convex::paginated_query` implements the convex-js
 `usePaginatedQuery` state machine as a growing, live-updating list over a
 paginated query. It keeps one live subscription per page, exposes
 `load_more`, avoids seams at page boundaries via query journals, and resets
-on argument changes or stale cursors. For one-shot calls without a
-WebSocket there is `convex::http_client`, plus file storage
+on argument changes or stale cursors. A page that grows past twice the
+requested size is split in two, the same way convex-js does it, so a busy
+list does not drift into the server's read limits. For one-shot calls
+without a WebSocket there is `convex::http_client`, plus file storage
 upload/download helpers.
 
 The protocol core is sans-IO: `convex::base_client` does no networking at

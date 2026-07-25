@@ -2,6 +2,7 @@
 
 #include <convex/protocol.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -10,6 +11,12 @@
 namespace convex {
 
 namespace {
+
+/// How many times in a row an incomplete page that cannot be split may reset
+/// the session before the helper gives up and reports an error. Each reset
+/// re-runs the query under a new cache-buster id, so a page that always comes
+/// back the same way would otherwise loop forever.
+constexpr unsigned MAX_UNSPLITTABLE_RESETS = 2;
 
 /// Cache-buster shared with every helper instance in the process, mirroring
 /// convex-js's module-global counter. A unique id per pagination session
@@ -26,7 +33,11 @@ struct page_fields {
     const value_array* items = nullptr;
     bool is_done = false;
     std::string continue_cursor;
+    /// Where the server suggests this page be cut in two. Absent when the
+    /// page is too small to have a split point.
+    std::optional<std::string> split_cursor;
     bool split_required = false;
+    bool split_recommended = false;
 };
 
 std::optional<page_fields> parse_page(const value& v) {
@@ -42,9 +53,15 @@ std::optional<page_fields> parse_page(const value& v) {
     f.items = &page_it->second.as_array();
     f.is_done = done_it->second.as_boolean();
     f.continue_cursor = cursor_it->second.as_string();
-    if (const auto status_it = o.find("pageStatus"); status_it != o.end()) {
-        f.split_required =
-            status_it->second.is_string() && status_it->second.as_string() == "SplitRequired";
+    if (const auto split_it = o.find("splitCursor");
+        split_it != o.end() && split_it->second.is_string()) {
+        f.split_cursor = split_it->second.as_string();
+    }
+    if (const auto status_it = o.find("pageStatus");
+        status_it != o.end() && status_it->second.is_string()) {
+        const std::string& status = status_it->second.as_string();
+        f.split_required = status == "SplitRequired";
+        f.split_recommended = status == "SplitRecommended";
     }
     return f;
 }
@@ -85,6 +102,10 @@ std::string_view pagination_status_name(pagination_status status) {
 }
 
 struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
+    /// Identifies a page across reorderings. Page positions shift when a
+    /// split swaps one page for two, so callbacks address pages by key.
+    using page_key = std::uint64_t;
+
     // Immutable after construction.
     client* owner;
     std::string udf_path;
@@ -103,10 +124,39 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
     bool stopped = false;
 
     struct page {
+        page_key key = 0;
         client::subscription sub;
         std::optional<function_result> result;
+        /// Start of the page; absent means the beginning of the query.
+        std::optional<std::string> cursor;
+        /// End of the page. Only set on the halves of a split, which pin
+        /// both ends of their range so the two of them cover exactly what
+        /// the page they replace covered.
+        std::optional<std::string> end_cursor;
+        /// Set when a split of this page failed, so it is not retried on
+        /// every subsequent update of the same page.
+        bool split_disabled = false;
     };
+
+    /// A split in flight: two half-pages loading in parallel while the page
+    /// they will replace stays live and visible. Swapping them in only once
+    /// both have results keeps the combined list gapless at every moment.
+    struct pending_split {
+        page_key original = 0;
+        page first;
+        page second;
+    };
+
+    /// Active pages, in result order.
     std::vector<page> pages;
+    /// Splits in flight. Their halves are not in `pages` yet.
+    std::vector<pending_split> splits;
+    page_key next_key = 0;
+    /// Consecutive resets caused by an incomplete page with no split point.
+    unsigned unsplittable_resets = 0;
+    /// Set when those resets hit MAX_UNSPLITTABLE_RESETS: the query cannot
+    /// return a complete page, so the snapshot reports an error instead.
+    bool unsplittable_page = false;
 
     paginated_impl(client& c, paginated_query::options&& o,
                    paginated_query::snapshot_callback&& cb)
@@ -117,46 +167,189 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
           on_update(std::move(cb)),
           pagination_id(next_pagination_id()) {}
 
-    // Requires `m`. Appends and subscribes one page.
-    void add_page(std::size_t num_items, std::optional<std::string> cursor) {
+    // Requires `m`. Looks up a page by key, in `pages` or in a split's halves.
+    page* find_page(page_key key) {
+        for (page& p : pages) {
+            if (p.key == key) return &p;
+        }
+        for (pending_split& s : splits) {
+            if (s.first.key == key) return &s.first;
+            if (s.second.key == key) return &s.second;
+        }
+        return nullptr;
+    }
+
+    // Requires `m`. Index into `splits` of the split `key` is a half of.
+    std::optional<std::size_t> split_of_half(page_key key) const {
+        for (std::size_t i = 0; i < splits.size(); ++i) {
+            if (splits[i].first.key == key || splits[i].second.key == key) return i;
+        }
+        return std::nullopt;
+    }
+
+    // Requires `m`. True while `key` is being replaced by two halves.
+    bool is_splitting(page_key key) const {
+        return std::any_of(splits.begin(), splits.end(),
+                           [key](const pending_split& s) { return s.original == key; });
+    }
+
+    // Requires `m`. Subscribes an already-stored page to its page query.
+    void subscribe_page(page& p, std::size_t num_items) {
         const std::uint64_t gen = generation;
-        const std::size_t index = pages.size();
-        pages.emplace_back();
+        const page_key key = p.key;
         value_object opts;
         // numItems and id are float64 on the wire: paginationOptsValidator
         // uses v.number(), which rejects Convex int64 ($integer).
         opts.emplace("numItems", value(static_cast<double>(num_items)));
-        opts.emplace("cursor", cursor ? value(std::move(*cursor)) : value(nullptr));
+        opts.emplace("cursor", p.cursor ? value(*p.cursor) : value(nullptr));
+        if (p.end_cursor) opts.emplace("endCursor", value(*p.end_cursor));
         opts.emplace("id", value(static_cast<double>(pagination_id)));
         value_object args = user_args;
         args.insert_or_assign("paginationOpts", value(std::move(opts)));
-        pages[index].sub = owner->subscribe(
+        // subscribe() delivers an already-known result synchronously, so the
+        // page callback can run — and reset the session, destroying `p` —
+        // before this returns. Everything after it goes through find_page;
+        // if the page is gone, the local subscription drops on scope exit.
+        client::subscription sub = owner->subscribe(
             udf_path, std::move(args),
-            [self = shared_from_this(), gen, index](const function_result& r) {
-                self->on_page_result(gen, index, r);
+            [self = shared_from_this(), gen, key](const function_result& r) {
+                self->on_page_result(gen, key, r);
             });
+        if (gen != generation) return;
+        if (page* current = find_page(key)) current->sub = std::move(sub);
+    }
+
+    // Requires `m`. Appends and subscribes one page at the end of the list.
+    void add_page(std::size_t num_items, std::optional<std::string> cursor) {
+        pages.emplace_back();
+        page& p = pages.back();
+        p.key = ++next_key;
+        p.cursor = std::move(cursor);
+        subscribe_page(p, num_items);
     }
 
     // Requires `m`. Drops every page and starts a fresh session.
     void do_reset() {
         ++generation;
         pagination_id = next_pagination_id();
+        splits.clear();
         pages.clear();  // unsubscribes
         add_page(initial_num_items, std::nullopt);
     }
 
-    void on_page_result(std::uint64_t gen, std::size_t index, const function_result& r) {
+    // Requires `m`. A caller-driven reset (new args, or reset()) also clears
+    // the unsplittable-page state: the query may well behave differently now.
+    void hard_reset() {
+        unsplittable_resets = 0;
+        unsplittable_page = false;
+        do_reset();
+    }
+
+    // Requires `m`. Starts replacing `original` with two halves covering the
+    // same range: (cursor, split_cursor] and (split_cursor, continue_cursor].
+    void start_split(page_key original, const std::string& split_cursor,
+                     const std::string& continue_cursor) {
+        const page* orig = find_page(original);
+        if (orig == nullptr) return;
+        pending_split s;
+        s.original = original;
+        s.first.key = ++next_key;
+        // The first half starts where the original page started — NOT at the
+        // beginning of the query. convex-js sent a null cursor here, which
+        // duplicated every item before the page (get-convex/convex-js#54981).
+        s.first.cursor = orig->cursor;
+        s.first.end_cursor = split_cursor;
+        s.second.key = ++next_key;
+        s.second.cursor = split_cursor;
+        s.second.end_cursor = continue_cursor;
+        const page_key first_key = s.first.key;
+        const page_key second_key = s.second.key;
+        splits.push_back(std::move(s));
+        // Re-find between the two: subscribing the first half can re-enter
+        // and move the splits vector out from under us.
+        if (page* p = find_page(first_key)) subscribe_page(*p, initial_num_items);
+        if (page* p = find_page(second_key)) subscribe_page(*p, initial_num_items);
+    }
+
+    // Requires `m`. Called when a half of split `index` gets a result.
+    void advance_split(std::size_t index) {
+        {
+            pending_split& s = splits[index];
+            if (!s.first.result || !s.second.result) return;
+            if (!s.first.result->ok() || !s.second.result->ok()) {
+                // A half failed for a reason other than InvalidCursor (that
+                // resets before we get here). Abandon the split: the original
+                // page is still live and still shows a usable result. Don't
+                // retry it, or every later update of that page re-runs the
+                // same failing query.
+                if (page* orig = find_page(s.original)) orig->split_disabled = true;
+                splits.erase(splits.begin() + static_cast<std::ptrdiff_t>(index));
+                return;
+            }
+        }
+        pending_split done = std::move(splits[index]);
+        splits.erase(splits.begin() + static_cast<std::ptrdiff_t>(index));
+        const auto it = std::find_if(pages.begin(), pages.end(), [&](const page& p) {
+            return p.key == done.original;
+        });
+        if (it == pages.end()) return;
+        const auto at = it - pages.begin();
+        const page_key first_key = done.first.key;
+        const page_key second_key = done.second.key;
+        *it = std::move(done.first);  // unsubscribes the page being replaced
+        pages.insert(pages.begin() + at + 1, std::move(done.second));
+        // A half can be oversized in its own right (the range it inherited
+        // may still be too big), so keep splitting until it isn't.
+        consider_split(first_key);
+        consider_split(second_key);
+    }
+
+    // Requires `m`. Splits `key` if the server asked for it, or if the page
+    // has outgrown twice the requested size. Mirrors convex-js's
+    // processPaginatedQuerySplits.
+    void consider_split(page_key key) {
+        page* p = find_page(key);
+        if (p == nullptr || p->split_disabled || !p->result || !p->result->ok()) return;
+        if (is_splitting(key)) return;
+        const auto f = parse_page(p->result->get_value());
+        if (!f) return;
+        if (f->split_required && !f->split_cursor) {
+            // No split point: a page the server calls incomplete cannot be
+            // repaired in place, so start over with right-sized pages.
+            reset_for_unsplittable_page();
+            return;
+        }
+        unsplittable_resets = 0;  // a page came back whole: not looping
+        if (!f->split_cursor) return;
+        if (f->split_required || f->split_recommended ||
+            f->items->size() > initial_num_items * 2) {
+            start_split(key, *f->split_cursor, f->continue_cursor);
+        }
+    }
+
+    // Requires `m`.
+    void reset_for_unsplittable_page() {
+        if (++unsplittable_resets > MAX_UNSPLITTABLE_RESETS) {
+            // Re-fetching keeps producing the same incomplete page, and each
+            // reset costs a fresh (uncached) query. Stop and report.
+            unsplittable_page = true;
+            return;
+        }
+        do_reset();
+    }
+
+    void on_page_result(std::uint64_t gen, page_key key, const function_result& r) {
         std::lock_guard lk(m);
         if (stopped || gen != generation) return;
-        pages[index].result = r;
+        page* p = find_page(key);
+        if (p == nullptr) return;
+        p->result = r;
         if (is_invalid_cursor(r)) {
             do_reset();
-        } else if (r.ok()) {
-            if (const auto f = parse_page(r.get_value()); f && f->split_required) {
-                // The page outgrew the server's read limits and may be
-                // incomplete. convex-js splits it; we reset (see header).
-                do_reset();
-            }
+        } else if (const auto index = split_of_half(key); index) {
+            advance_split(*index);
+        } else {
+            consider_split(key);
         }
         notify();
     }
@@ -164,6 +357,15 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
     // Requires `m`.
     paginated_snapshot compute_snapshot() const {
         paginated_snapshot snap;
+        if (unsplittable_page) {
+            snap.status = pagination_status::error;
+            snap.error = function_result::error(
+                "convex: paginated query \"" + udf_path +
+                "\" keeps returning an incomplete page (pageStatus \"SplitRequired\") that "
+                "has no splitCursor to split it on. Reduce initial_num_items, or make the "
+                "query read less data per item.");
+            return snap;
+        }
         bool all_loaded = true;
         bool last_is_done = false;
         for (const page& p : pages) {
@@ -209,6 +411,7 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
         std::lock_guard lk(m);
         stopped = true;
         on_update = nullptr;
+        splits.clear();
         pages.clear();
     }
 };
@@ -255,7 +458,7 @@ bool paginated_query::set_args(value_object args) {
     if (impl_->stopped) return false;
     if (serialize_args(args) == serialize_args(impl_->user_args)) return false;
     impl_->user_args = std::move(args);
-    impl_->do_reset();
+    impl_->hard_reset();
     impl_->notify();
     return true;
 }
@@ -264,7 +467,7 @@ void paginated_query::reset() {
     if (!impl_) return;
     std::lock_guard lk(impl_->m);
     if (impl_->stopped) return;
-    impl_->do_reset();
+    impl_->hard_reset();
     impl_->notify();
 }
 
