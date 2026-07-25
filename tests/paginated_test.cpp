@@ -416,16 +416,17 @@ TEST(Paginated, SplitRequiredSplitsPageInTwo) {
     EXPECT_EQ(first_opts["id"].get<double>(), h.pagination_id(0))
         << "a split stays inside the same pagination session";
 
-    // Until both halves load, the original page stays live and visible.
-    EXPECT_EQ(h.pq.snapshot().results, items({"a", "b", "c", "d"}));
-    EXPECT_EQ(h.pq.snapshot().status, pagination_status::can_load_more);
-    EXPECT_FALSE(h.sent_remove(0));
+    // The page is incomplete, so it is not published while the split runs:
+    // a short list beats a list with a hole in it.
+    EXPECT_TRUE(h.pq.snapshot().results.empty());
+    EXPECT_EQ(h.pq.snapshot().status, pagination_status::loading_first_page);
+    EXPECT_FALSE(h.sent_remove(0)) << "the original page stays subscribed";
 
     h.transport->server_send(
         0, transition_page({1, TS1}, {2, TS2}, 1, page_value({"a", "b"}, false, "s1"), "j1"));
     h.settle();
-    EXPECT_EQ(h.pq.snapshot().results, items({"a", "b", "c", "d"}))
-        << "half loaded: no partial swap, no duplicated items";
+    EXPECT_TRUE(h.pq.snapshot().results.empty())
+        << "one half is not a page: no partial swap";
     EXPECT_FALSE(h.sent_remove(0));
 
     h.transport->server_send(
@@ -438,6 +439,36 @@ TEST(Paginated, SplitRequiredSplitsPageInTwo) {
     // The list keeps growing from the second half's cursor.
     ASSERT_TRUE(h.pq.load_more(2));
     EXPECT_EQ(h.opts_for(3)["cursor"], "c1");
+}
+
+TEST(Paginated, IncompletePageHidesItselfButNotThePagesBeforeIt) {
+    // Everything up to the incomplete page keeps showing; the truncated page
+    // and anything after it wait for the split. Mirrors convex-js's
+    // usePaginatedQuery, which stops results before a SplitRequired page.
+    harness h;
+    h.transport->server_send(0, transition_page({0, TS0}, {1, TS1}, 0,
+                                                page_value({"a", "b"}, false, "c1"), "j0"));
+    ASSERT_TRUE(h.wait_status(pagination_status::can_load_more));
+    ASSERT_TRUE(h.pq.load_more(2));
+
+    // Page two comes back truncated: the server read past its limit, so "c"
+    // may not be all of (c1, c2].
+    h.transport->server_send(
+        0, transition_page({1, TS1}, {2, TS2}, 1,
+                           page_value({"c"}, false, "c2", "SplitRequired", "s2"), "j1"));
+    ASSERT_TRUE(pump_until(h.c, [&] { return !h.add_for(3).empty(); }));
+    const auto during = h.pq.snapshot();
+    EXPECT_EQ(during.results, items({"a", "b"})) << "page one is complete and stays";
+    EXPECT_EQ(during.status, pagination_status::loading_more);
+    EXPECT_TRUE(during.is_loading());
+
+    // Both halves land: the full range appears at once.
+    h.transport->server_send(
+        0, transition_page({2, TS2}, {3, TS3}, 2, page_value({"c"}, false, "s2"), "j2"));
+    h.transport->server_send(
+        0, transition_page({3, TS3}, {4, TS4}, 3, page_value({"d"}, true, "c2"), "j3"));
+    ASSERT_TRUE(h.wait_status(pagination_status::exhausted));
+    EXPECT_EQ(h.pq.snapshot().results, items({"a", "b", "c", "d"}));
 }
 
 TEST(Paginated, SplitFirstHalfStartsAtTheOriginalPagesCursor) {

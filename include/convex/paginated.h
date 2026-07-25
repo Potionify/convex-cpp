@@ -28,10 +28,11 @@
 // that is merely oversized (complete, but larger than asked for) is never
 // reset: if its split fails, it stays as it is.
 //
-// Known, and deliberate for parity with convex-js: between a SplitRequired
-// update arriving and both halves loading, the incomplete page is what the
-// snapshot shows. If the server truncated it, the list has a gap for that one
-// round trip. convex-js splits from the updated page result the same way.
+// A page the server reports as SplitRequired may be missing part of its
+// range, so the snapshot stops before it: the pages ahead of it stay visible
+// and the status goes back to loading until the split (or reset) repairs it.
+// A list with a hole in it is worse than a shorter list. convex-js's
+// usePaginatedQuery does the same.
 //
 // Threading. All callbacks (page updates) arrive through the owning client's
 // delivery mechanism — the process_events() pump by default. The on_update

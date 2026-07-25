@@ -424,12 +424,21 @@ struct paginated_impl : std::enable_shared_from_this<paginated_impl> {
                     "\" returned a value that is not a PaginationResult");
                 return snap;
             }
+            if (f->split_required) {
+                // The server could not read this page in full, so its items
+                // may be missing part of the range. Stop before it rather
+                // than publish a list with a hole in it — the split (or the
+                // reset) that repairs it is already under way. This is what
+                // convex-js's usePaginatedQuery does.
+                all_loaded = false;
+                break;
+            }
             snap.results.insert(snap.results.end(), f->items->begin(), f->items->end());
             last_is_done = f->is_done;
         }
         if (!all_loaded) {
-            snap.status = (pages.size() == 1) ? pagination_status::loading_first_page
-                                              : pagination_status::loading_more;
+            snap.status = snap.results.empty() ? pagination_status::loading_first_page
+                                               : pagination_status::loading_more;
         } else {
             snap.status = last_is_done ? pagination_status::exhausted
                                        : pagination_status::can_load_more;
